@@ -781,6 +781,22 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
+    def list_sessions(self, limit=20, offset=0, source=None):
+        """List sessions with pagination. Returns (sessions, total)."""
+        with self._lock:
+            where = "WHERE source = ?" if source else ""
+            params = [source] if source else []
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM sessions {where}", params
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            ).fetchall()
+            cols = [d[0] for d in self._conn.description]
+            sessions = [dict(zip(cols, row)) for row in rows]
+            return sessions, total
+
     def list_sessions_rich(
         self,
         source: str = None,
