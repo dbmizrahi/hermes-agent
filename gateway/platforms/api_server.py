@@ -7,8 +7,6 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
-- POST /v1/runs                    — start a run, returns run_id immediately (202)
-- GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -302,10 +300,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
-        # Creation timestamps for orphaned-run TTL sweep
-        self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -427,11 +421,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
-        # Load fallback provider chain so the API server platform has the
-        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        from gateway.run import GatewayRunner
-        fallback_model = GatewayRunner._load_fallback_model()
-
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -445,7 +434,6 @@ class APIServerAdapter(BasePlatformAdapter):
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             session_db=self._ensure_session_db(),
-            fallback_model=fallback_model,
         )
         return agent
 
@@ -1244,6 +1232,158 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         return items
 
+
+    async def _handle_ws_agent(self, request):
+        """GET /ws/agent -- WebSocket endpoint for real-time agent communication."""
+        token = request.query.get("token", "")
+        if self._api_key and token != self._api_key:
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json({"type": "error", "message": "Invalid API key"})
+            await ws.close()
+            return ws
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        connection_id = str(uuid.uuid4())[:8]
+        logger.info("[%s] WebSocket agent connection established: %s", self.name, connection_id)
+
+        try:
+            msg = await ws.receive()
+            if msg.type != web.WSMsgType.TEXT:
+                await ws.close()
+                return ws
+
+            try:
+                payload = json.loads(msg.data)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "message": "Invalid JSON"})
+                await ws.close()
+                return ws
+
+            if payload.get("type") != "message" or not payload.get("content"):
+                await ws.send_json({"type": "error", "message": "Expected {type: message, content: ...}"})
+                await ws.close()
+                return ws
+
+            user_message = payload["content"]
+            session_id = payload.get("session_id") or str(uuid.uuid4())
+            tool_events = payload.get("tool_events", False)
+            history = []
+
+            if payload.get("session_id"):
+                try:
+                    db = self._ensure_session_db()
+                    if db is not None:
+                        history = db.get_messages_as_conversation(session_id)
+                except Exception as e:
+                    logger.warning("Failed to load session %s: %s", session_id, e)
+
+            output_queue = asyncio.Queue()
+            agent_ref = [None]
+
+            agent_task = asyncio.ensure_future(
+                self._ws_run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    session_id=session_id,
+                    output_queue=output_queue,
+                    agent_ref=agent_ref,
+                    tool_events=tool_events,
+                )
+            )
+
+            try:
+                while True:
+                    client_fut = asyncio.ensure_future(ws.receive())
+                    queue_fut = asyncio.ensure_future(output_queue.get())
+                    done, pending = await asyncio.wait(
+                        [client_fut, queue_fut], return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for f in pending:
+                        f.cancel()
+                    if client_fut in done:
+                        m = client_fut.result()
+                        if m.type == web.WSMsgType.TEXT:
+                            try:
+                                d = json.loads(m.data)
+                                if d.get("type") == "interrupt" and agent_ref[0]:
+                                    agent_ref[0].interrupt("Client requested interrupt")
+                            except Exception:
+                                pass
+                        elif m.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR, web.WSMsgType.CLOSING):
+                            if agent_ref[0]:
+                                agent_ref[0].interrupt("WebSocket client disconnected")
+                            break
+                    elif queue_fut in done:
+                        item = queue_fut.result()
+                        if item is None:
+                            break
+                        await ws.send_json(item)
+            except asyncio.CancelledError:
+                pass
+
+            if not agent_task.done():
+                try:
+                    await agent_task
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("[%s] WebSocket agent handler error: %s", self.name, e, exc_info=True)
+            try:
+                await ws.send_json({"type": "error", "message": str(e)})
+            except Exception:
+                pass
+        finally:
+            try:
+                if not ws.closed:
+                    await ws.close()
+            except Exception:
+                pass
+        return ws
+
+    async def _ws_run_agent(
+        self, user_message, conversation_history, session_id,
+        output_queue, agent_ref, tool_events=False,
+    ):
+        """Run AIAgent with streaming callbacks via async queue."""
+        try:
+            def _on_delta(delta):
+                if delta is not None:
+                    try:
+                        output_queue.put_nowait({"type": "delta", "content": delta})
+                    except asyncio.QueueFull:
+                        pass
+
+            def _on_tool_progress(name, preview, args_obj):
+                if not tool_events or name.startswith("_"):
+                    return
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+                try:
+                    output_queue.put_nowait({"type": "tool_progress", "name": name, "preview": preview or "", "emoji": emoji})
+                except asyncio.QueueFull:
+                    pass
+
+            def _blocking_run():
+                agent = self._create_agent(session_id=session_id, stream_delta_callback=_on_delta, tool_progress_callback=_on_tool_progress)
+                agent_ref[0] = agent
+                result = agent.run_conversation(user_message=user_message, conversation_history=conversation_history)
+                return {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0, "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0, "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
+
+            loop = asyncio.get_event_loop()
+            usage = await loop.run_in_executor(None, _blocking_run)
+            output_queue.put_nowait({"type": "done", "session_id": session_id, "usage": usage})
+            output_queue.put_nowait(None)
+        except Exception as e:
+            logger.error("[%s] WebSocket agent run error: %s", self.name, e, exc_info=True)
+            try:
+                output_queue.put_nowait({"type": "error", "message": str(e)})
+                output_queue.put_nowait(None)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Agent execution
     # ------------------------------------------------------------------
@@ -1294,236 +1434,6 @@ class APIServerAdapter(BasePlatformAdapter):
         return await loop.run_in_executor(None, _run)
 
     # ------------------------------------------------------------------
-    # /v1/runs — structured event streaming
-    # ------------------------------------------------------------------
-
-    _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
-    _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
-
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
-
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-            ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
-            elif event_type == "reasoning.available":
-                _push({
-                    "event": "reasoning.available",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "text": preview or "",
-                })
-            # _thinking and subagent_progress are intentionally not forwarded
-
-        return _callback
-
-    async def _handle_runs(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs — start an agent run, return run_id immediately."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
-            return web.json_response(
-                _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
-                status=429,
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-
-        raw_input = body.get("input")
-        if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
-
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
-
-        run_id = f"run_{uuid.uuid4().hex}"
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = time.time()
-
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        # Also wire stream_delta_callback so message.delta events flow through
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
-
-        instructions = body.get("instructions")
-        previous_response_id = body.get("previous_response_id")
-        conversation_history: List[Dict[str, str]] = []
-        if previous_response_id:
-            stored = self._response_store.get(previous_response_id)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                if instructions is None:
-                    instructions = stored.get("instructions")
-
-        session_id = body.get("session_id") or run_id
-        ephemeral_system_prompt = instructions
-
-        async def _run_and_close():
-            try:
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                )
-                def _run_sync():
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                    )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
-
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
-                    "event": "run.completed",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "output": final_response,
-                    "usage": usage,
-                })
-            except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
-                try:
-                    q.put_nowait({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": str(exc),
-                    })
-                except Exception:
-                    pass
-            finally:
-                # Sentinel: signal SSE stream to close
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
-
-        task = asyncio.create_task(_run_and_close())
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            pass
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
-
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
-
-    async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
-        for _ in range(20):
-            if run_id in self._run_streams:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        q = self._run_streams[run_id]
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-        await response.prepare(request)
-
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
-                    break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
-        except Exception as exc:
-            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
-        finally:
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
-
-        return response
-
-    async def _sweep_orphaned_runs(self) -> None:
-        """Periodically clean up run streams that were never consumed."""
-        while True:
-            await asyncio.sleep(60)
-            now = time.time()
-            stale = [
-                run_id
-                for run_id, created_at in list(self._run_streams_created.items())
-                if now - created_at > self._RUN_STREAM_TTL
-            ]
-            for run_id in stale:
-                logger.debug("[api_server] sweeping orphaned run %s", run_id)
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
-
-    # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
 
@@ -1553,17 +1463,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
-            # Start background sweep to clean up orphaned (unconsumed) run streams
-            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
-            try:
-                self._background_tasks.add(sweep_task)
-            except TypeError:
-                pass
-            if hasattr(sweep_task, "add_done_callback"):
-                sweep_task.add_done_callback(self._background_tasks.discard)
+            # WebSocket agent communication
+            self._app.router.add_get("/ws/agent", self._handle_ws_agent)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket
