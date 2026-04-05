@@ -92,6 +92,44 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS auth_tokens (
+                jti TEXT PRIMARY KEY,
+                token_type TEXT NOT NULL,
+                issued_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )"""
+        )
+        self._conn.commit()
+
+    def store_refresh_token(self, jti: str, expires_at: float) -> None:
+        import time
+        self._conn.execute(
+            "INSERT OR REPLACE INTO auth_tokens (jti, token_type, issued_at, expires_at) VALUES (?, 'refresh', ?, ?)",
+            (jti, time.time(), expires_at),
+        )
+        self._conn.commit()
+
+    def is_refresh_token_valid(self, jti: str) -> bool:
+        import time
+        row = self._conn.execute(
+            "SELECT token_type, expires_at FROM auth_tokens WHERE jti = ?", (jti,)
+        ).fetchone()
+        if row is None:
+            return False
+        token_type, expires_at = row
+        return token_type == "refresh" and expires_at > time.time()
+
+    def revoke_token(self, jti: str) -> None:
+        self._conn.execute(
+            "UPDATE auth_tokens SET token_type='revoked' WHERE jti = ?", (jti,)
+        )
+        self._conn.commit()
+
+    def prune_expired_tokens(self) -> None:
+        import time
+        self._conn.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (time.time(),))
+        self._conn.commit()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
@@ -301,6 +339,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._jwt_secret: Optional[bytes] = (
+            self._derive_jwt_secret(self._api_key) if self._api_key else None
+        )
+
+    @staticmethod
+    def _derive_jwt_secret(api_key: str) -> bytes:
+        import hashlib
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            api_key.encode("utf-8"),
+            b"hermes-jwt-salt-v1",
+            iterations=100_000,
+        )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -353,19 +404,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
-        Validate Bearer token from Authorization header.
+        Validate Bearer token from Authorization header or query param.
 
+        First attempts JWT decode for short-lived access tokens,
+        then falls back to raw API key comparison for backward compatibility.
         Returns None if auth is OK, or a 401 web.Response on failure.
         If no API key is configured, all requests are allowed.
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
 
+        # Try to extract token from Authorization header or query parameter
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if token == self._api_key:
-                return None  # Auth OK
+        if not auth_header:
+            auth_header = "Bearer " + request.query.get("token", "")
+
+        if not auth_header.startswith("Bearer "):
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        token = auth_header[7:].strip()
+
+        # Try JWT decode first
+        if self._jwt_secret and token != self._api_key:
+            try:
+                import jwt as pyjwt
+                payload = pyjwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+                if payload.get("type") == "access":
+                    return None  # Auth OK — stateless access token
+            except Exception:
+                pass  # Fall through to raw key check
+
+        # Raw key fallback (backward compat)
+        if token == self._api_key:
+            return None
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
@@ -440,6 +514,145 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+
+    async def _handle_auth_token(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/token - Exchange raw API key for JWT tokens."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "No API key configured", "type": "server_error", "code": "no_api_key"}},
+                status=501,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        provided_key = body.get("api_key", "")
+        if provided_key != self._api_key:
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        import jwt as pyjwt
+        now = int(time.time())
+        access_jti = str(uuid.uuid4())
+        refresh_jti = str(uuid.uuid4())
+
+        access_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": now + 3600,
+             "jti": access_jti, "type": "access"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        refresh_exp = now + 30 * 24 * 3600
+        refresh_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": refresh_exp,
+             "jti": refresh_jti, "type": "refresh"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        self._response_store.store_refresh_token(refresh_jti, float(refresh_exp))
+
+        return web.json_response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })
+
+    async def _handle_auth_refresh(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/refresh - Exchange a refresh token for new token pair."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "No API key configured", "type": "server_error", "code": "no_api_key"}},
+                status=501,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        refresh_token_str = body.get("refresh_token", "")
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(refresh_token_str, self._jwt_secret, algorithms=["HS256"])
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Invalid or expired refresh token", "code": "invalid_token"}},
+                status=401,
+            )
+
+        if payload.get("type") != "refresh":
+            return web.json_response(
+                {"error": {"message": "Not a refresh token", "code": "invalid_token"}},
+                status=401,
+            )
+
+        jti = payload.get("jti", "")
+        if not self._response_store.is_refresh_token_valid(jti):
+            return web.json_response(
+                {"error": {"message": "Refresh token revoked or expired", "code": "token_revoked"}},
+                status=401,
+            )
+
+        # Rotate: revoke old refresh token, issue new pair
+        self._response_store.revoke_token(jti)
+
+        now = int(time.time())
+        new_access_jti = str(uuid.uuid4())
+        new_refresh_jti = str(uuid.uuid4())
+
+        access_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": now + 3600,
+             "jti": new_access_jti, "type": "access"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        refresh_exp = now + 30 * 24 * 3600
+        new_refresh_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": refresh_exp,
+             "jti": new_refresh_jti, "type": "refresh"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        self._response_store.store_refresh_token(new_refresh_jti, float(refresh_exp))
+
+        return web.json_response({
+            "access_token": access_token,
+            "refresh_token": new_refresh_token,
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })
+
+    async def _handle_auth_revoke(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/revoke - Revoke a refresh token (requires auth)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        refresh_token_str = body.get("refresh_token", "")
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(refresh_token_str, self._jwt_secret, algorithms=["HS256"])
+            jti = payload.get("jti", "")
+            self._response_store.revoke_token(jti)
+        except Exception:
+            pass  # Revoke is idempotent — ignore invalid tokens
+
+        return web.json_response({"revoked": True})
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -1311,6 +1524,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+
+
+            # JWT Auth endpoints
+            self._app.router.add_post("/api/auth/token", self._handle_auth_token)
+            self._app.router.add_post("/api/auth/refresh", self._handle_auth_refresh)
+            self._app.router.add_post("/api/auth/revoke", self._handle_auth_revoke)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket
