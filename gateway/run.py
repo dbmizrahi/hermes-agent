@@ -6851,12 +6851,15 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
     
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `hermes cron daemon` or system cron entry.
+
+    When ``adapters`` and ``loop`` are provided, passes them through to the
+    cron delivery path so live adapters can be used for E2EE rooms.
 
     Also refreshes the channel directory every 5 minutes and prunes the
     image/audio/document cache once per hour.
@@ -6871,7 +6874,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
     tick_count = 0
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False)
+            cron_tick(verbose=False, adapters=adapters, loop=loop)
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
 
@@ -7057,12 +7060,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     write_pid_file()
     atexit.register(remove_pid_file)
     
-    # Start background cron ticker so scheduled jobs fire automatically
+    # Start background cron ticker so scheduled jobs fire automatically.
+    # Pass the event loop so cron delivery can use live adapters (E2EE support).
     cron_stop = threading.Event()
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
         daemon=True,
         name="cron-ticker",
     )
