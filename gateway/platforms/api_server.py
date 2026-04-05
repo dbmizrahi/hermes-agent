@@ -654,6 +654,392 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"revoked": True})
 
+    # ------------------------------------------------------------------
+    # Config Management
+    # ------------------------------------------------------------------
+
+    _SECRET_KEYS = frozenset({
+        "key", "api_key", "token", "password", "secret",
+        "webhook_url", "bot_token", "access_token", "refresh_token",
+    })
+
+    @staticmethod
+    def _redact_secrets(obj: Any) -> Any:
+        """Recursively redact secret fields in a config dict."""
+        if isinstance(obj, dict):
+            return {
+                k: "***" if k.lower() in APIServerAdapter._SECRET_KEYS else APIServerAdapter._redact_secrets(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [APIServerAdapter._redact_secrets(item) for item in obj]
+        return obj
+
+    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/config — return redacted config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            config = {}
+        except Exception as e:
+            return web.json_response(_openai_error(f"Failed to read config: {e}"), status=500)
+
+        return web.json_response({"config": self._redact_secrets(config)})
+
+    @staticmethod
+    def _apply_dot_notation(config: dict, updates: dict) -> dict:
+        """Apply flat dot-notation keys and nested dict updates to config."""
+        import copy
+        result = copy.deepcopy(config)
+        for key, value in updates.items():
+            if isinstance(value, dict) and "." not in key:
+                if key not in result or not isinstance(result[key], dict):
+                    result[key] = {}
+                result[key] = APIServerAdapter._apply_dot_notation(result[key], value)
+            elif "." in key:
+                parts = key.split(".", 1)
+                if parts[0] not in result or not isinstance(result[parts[0]], dict):
+                    result[parts[0]] = {}
+                result[parts[0]] = APIServerAdapter._apply_dot_notation(
+                    result[parts[0]], {parts[1]: value}
+                )
+            else:
+                result[key] = value
+        return result
+
+    async def _handle_patch_config(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/config — update config with dot-notation support."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            updates = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if not isinstance(updates, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+
+        from hermes_cli.config import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                current = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            current = {}
+
+        merged = self._apply_dot_notation(current, updates)
+
+        try:
+            import yaml
+            yaml.safe_dump(merged)
+        except Exception as e:
+            return web.json_response(_openai_error(f"Invalid config values: {e}"), status=400)
+
+        try:
+            from utils import atomic_yaml_write
+            atomic_yaml_write(config_path, merged)
+        except Exception as e:
+            return web.json_response(_openai_error(f"Failed to write config: {e}"), status=500)
+
+        return web.json_response({"config": self._redact_secrets(merged)})
+
+    # ------------------------------------------------------------------
+    # Memory Management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_memory_entries(content: str) -> list:
+        """Split §-delimited memory file into entries."""
+        return [e.strip() for e in content.split("§") if e.strip()]
+
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        """GET /api/memory — return memory and user entries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        hermes_home = get_hermes_home()
+        result = {}
+        for target, filename, char_limit in [
+            ("memory", "MEMORY.md", 2200),
+            ("user", "USER.md", 1375),
+        ]:
+            path = hermes_home / "memories" / filename
+            try:
+                content = path.read_text(encoding="utf-8") if path.exists() else ""
+            except Exception:
+                content = ""
+            entries = self._parse_memory_entries(content)
+            char_count = len(content)
+            result[target] = {
+                "entries": entries,
+                "char_count": char_count,
+                "char_limit": char_limit,
+                "usage_pct": round(char_count / char_limit * 100, 1),
+            }
+
+        return web.json_response(result)
+
+    async def _handle_patch_memory(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/memory and DELETE /api/memory/entry — add/replace/remove entries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        target = body.get("target")  # "memory" or "user"
+        action = body.get("action")  # "add", "replace", "remove"
+        content = body.get("content", "")
+        old_text = body.get("old_text", "")
+
+        if target not in ("memory", "user"):
+            return web.json_response(_openai_error("'target' must be 'memory' or 'user'"), status=400)
+        if action not in ("add", "replace", "remove"):
+            return web.json_response(_openai_error("'action' must be 'add', 'replace', or 'remove'"), status=400)
+
+        filename = "MEMORY.md" if target == "memory" else "USER.md"
+        char_limit = 2200 if target == "memory" else 1375
+        from hermes_cli.config import get_hermes_home
+        path = get_hermes_home() / "memories" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        entries = self._parse_memory_entries(current)
+
+        if action == "add":
+            if content and self._memory_security_scan(content):
+                return web.json_response(_openai_error("Content rejected by security scan", code="security_scan_rejected"), status=422)
+            new_content = current.rstrip() + ("\n§\n" if entries else "") + content
+            if len(new_content) > char_limit:
+                return web.json_response(_openai_error(
+                    f"Adding this entry would exceed the {char_limit} char limit",
+                    code="memory_limit_exceeded"
+                ), status=413)
+            path.write_text(new_content, encoding="utf-8")
+
+        elif action in ("replace", "remove"):
+            if not old_text:
+                return web.json_response(_openai_error("'old_text' required for replace/remove"), status=400)
+            matches = [e for e in entries if old_text in e]
+            if len(matches) == 0:
+                return web.json_response(_openai_error("No entry found matching 'old_text'", code="entry_not_found"), status=400)
+            if len(matches) > 1:
+                return web.json_response(_openai_error("'old_text' matches multiple entries — be more specific", code="ambiguous_match"), status=400)
+            if action == "replace":
+                if content and self._memory_security_scan(content):
+                    return web.json_response(_openai_error("Content rejected by security scan", code="security_scan_rejected"), status=422)
+                entries = [content if old_text in e else e for e in entries]
+            else:
+                entries = [e for e in entries if old_text not in e]
+            path.write_text("\n§\n".join(entries), encoding="utf-8")
+
+        updated = path.read_text(encoding="utf-8") if path.exists() else ""
+        updated_entries = self._parse_memory_entries(updated)
+        return web.json_response({
+            "success": True,
+            "target": target,
+            "entries": updated_entries,
+            "char_count": len(updated),
+            "char_limit": char_limit,
+        })
+
+    @staticmethod
+    def _memory_security_scan(content: str) -> bool:
+        """Returns True if content should be rejected. Reuse logic from memory_tool.py."""
+        try:
+            from tools.memory_tool import _scan_for_threats
+            return _scan_for_threats(content)
+        except ImportError:
+            return False
+
+    # ------------------------------------------------------------------
+    # Skills Management
+    # ------------------------------------------------------------------
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills — list installed skills."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+        category_filter = request.rel_url.query.get("category")
+        skills = []
+
+        if skills_dir.exists():
+            for skill_path in skills_dir.rglob("SKILL.md"):
+                skill = self._parse_skill_metadata(skill_path)
+                if category_filter and skill.get("category") != category_filter:
+                    continue
+                skills.append(skill)
+
+        skills.sort(key=lambda s: s["name"])
+        return web.json_response({"skills": skills, "total": len(skills)})
+
+    @staticmethod
+    def _parse_skill_metadata(skill_path) -> dict:
+        """Parse SKILL.md frontmatter for metadata."""
+        import re
+        content = skill_path.read_text(encoding="utf-8", errors="replace")
+        name = skill_path.parent.name
+        category = skill_path.parent.parent.name
+        description = ""
+        version = None
+
+        fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if fm_match:
+            try:
+                import yaml
+                fm = yaml.safe_load(fm_match.group(1)) or {}
+                description = fm.get("description", "")
+                version = fm.get("version")
+                name = fm.get("name", name)
+            except Exception:
+                pass
+
+        return {
+            "name": name,
+            "category": category,
+            "description": description,
+            "version": version,
+            "path": str(skill_path.parent),
+            "has_references": (skill_path.parent / "references").exists(),
+            "has_scripts": (skill_path.parent / "scripts").exists(),
+            "has_templates": (skill_path.parent / "templates").exists(),
+        }
+
+    async def _handle_get_skill(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills/{name} — get a specific skill."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+
+        for candidate in skills_dir.rglob("SKILL.md"):
+            if candidate.parent.name == name:
+                skill = self._parse_skill_metadata(candidate)
+                return web.json_response(skill)
+
+        return web.json_response(_openai_error("Skill not found", err_type="not_found_error"), status=404)
+
+    async def _handle_install_skill(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/install — install a skill from the hub."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        skill_id = body.get("skill", "").strip()
+        force = body.get("force", False)
+
+        if not skill_id:
+            return web.json_response(_openai_error("Missing 'skill' field"), status=400)
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: self._install_skill_sync(skill_id, force))
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response(_openai_error(str(e), err_type="install_error"), status=422)
+
+    @staticmethod
+    def _install_skill_sync(skill_id: str, force: bool) -> dict:
+        """Synchronous wrapper for skill installation."""
+        from hermes_cli.skills_hub import install_skill
+        return install_skill(skill_id, force=force)
+
+    async def _handle_delete_skill(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/skills/{name} — remove an installed skill."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+
+        skill_path = None
+        for candidate in skills_dir.rglob("SKILL.md"):
+            if candidate.parent.name == name:
+                skill_path = candidate.parent
+                break
+
+        if skill_path is None:
+            return web.json_response(_openai_error("Skill not found", err_type="not_found_error"), status=404)
+
+        import shutil
+        shutil.rmtree(skill_path)
+        return web.Response(status=204)
+
+    async def _handle_check_skills(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/check — check for skill updates."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._check_skills_sync)
+        return web.json_response(result)
+
+    @staticmethod
+    def _check_skills_sync() -> dict:
+        """Synchronous wrapper for checking skill updates."""
+        try:
+            from hermes_cli.skills_hub import check_skill_updates
+            return check_skill_updates()
+        except Exception as e:
+            return {"error": str(e), "updates_available": [], "up_to_date": []}
+
+    async def _handle_update_skills(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/update — update skills."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        skills_filter = body.get("skills")  # None = update all
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: self._update_skills_sync(skills_filter))
+        return web.json_response(result)
+
+    @staticmethod
+    def _update_skills_sync(skills_filter: Optional[List[str]] = None) -> dict:
+        """Synchronous wrapper for updating skills."""
+        try:
+            from hermes_cli.skills_hub import update_skills
+            return update_skills(skills=skills_filter)
+        except Exception as e:
+            return {"error": str(e), "updated": [], "failed": []}
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
@@ -1798,6 +2184,23 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auth/token", self._handle_auth_token)
             self._app.router.add_post("/api/auth/refresh", self._handle_auth_refresh)
             self._app.router.add_post("/api/auth/revoke", self._handle_auth_revoke)
+
+            # Config management
+            self._app.router.add_get("/api/config", self._handle_get_config)
+            self._app.router.add_patch("/api/config", self._handle_patch_config)
+
+            # Memory management
+            self._app.router.add_get("/api/memory", self._handle_get_memory)
+            self._app.router.add_patch("/api/memory", self._handle_patch_memory)
+            self._app.router.add_delete("/api/memory/entry", self._handle_patch_memory)
+
+            # Skills management (literals BEFORE /api/skills/{name})
+            self._app.router.add_get("/api/skills", self._handle_list_skills)
+            self._app.router.add_get("/api/skills/{name}", self._handle_get_skill)
+            self._app.router.add_post("/api/skills/install", self._handle_install_skill)
+            self._app.router.add_post("/api/skills/check", self._handle_check_skills)
+            self._app.router.add_post("/api/skills/update", self._handle_update_skills)
+            self._app.router.add_delete("/api/skills/{name}", self._handle_delete_skill)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket
