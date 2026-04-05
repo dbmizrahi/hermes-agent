@@ -92,6 +92,44 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS auth_tokens (
+                jti TEXT PRIMARY KEY,
+                token_type TEXT NOT NULL,
+                issued_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )"""
+        )
+        self._conn.commit()
+
+    def store_refresh_token(self, jti: str, expires_at: float) -> None:
+        import time
+        self._conn.execute(
+            "INSERT OR REPLACE INTO auth_tokens (jti, token_type, issued_at, expires_at) VALUES (?, 'refresh', ?, ?)",
+            (jti, time.time(), expires_at),
+        )
+        self._conn.commit()
+
+    def is_refresh_token_valid(self, jti: str) -> bool:
+        import time
+        row = self._conn.execute(
+            "SELECT token_type, expires_at FROM auth_tokens WHERE jti = ?", (jti,)
+        ).fetchone()
+        if row is None:
+            return False
+        token_type, expires_at = row
+        return token_type == "refresh" and expires_at > time.time()
+
+    def revoke_token(self, jti: str) -> None:
+        self._conn.execute(
+            "UPDATE auth_tokens SET token_type='revoked' WHERE jti = ?", (jti,)
+        )
+        self._conn.commit()
+
+    def prune_expired_tokens(self) -> None:
+        import time
+        self._conn.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (time.time(),))
+        self._conn.commit()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
@@ -301,6 +339,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._jwt_secret: Optional[bytes] = (
+            self._derive_jwt_secret(self._api_key) if self._api_key else None
+        )
+
+    @staticmethod
+    def _derive_jwt_secret(api_key: str) -> bytes:
+        import hashlib
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            api_key.encode("utf-8"),
+            b"hermes-jwt-salt-v1",
+            iterations=100_000,
+        )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -353,19 +404,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
-        Validate Bearer token from Authorization header.
+        Validate Bearer token from Authorization header or query param.
 
+        First attempts JWT decode for short-lived access tokens,
+        then falls back to raw API key comparison for backward compatibility.
         Returns None if auth is OK, or a 401 web.Response on failure.
         If no API key is configured, all requests are allowed.
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
 
+        # Try to extract token from Authorization header or query parameter
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if token == self._api_key:
-                return None  # Auth OK
+        if not auth_header:
+            auth_header = "Bearer " + request.query.get("token", "")
+
+        if not auth_header.startswith("Bearer "):
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        token = auth_header[7:].strip()
+
+        # Try JWT decode first
+        if self._jwt_secret and token != self._api_key:
+            try:
+                import jwt as pyjwt
+                payload = pyjwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+                if payload.get("type") == "access":
+                    return None  # Auth OK — stateless access token
+            except Exception:
+                pass  # Fall through to raw key check
+
+        # Raw key fallback (backward compat)
+        if token == self._api_key:
+            return None
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
@@ -440,6 +514,531 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+
+    async def _handle_auth_token(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/token - Exchange raw API key for JWT tokens."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "No API key configured", "type": "server_error", "code": "no_api_key"}},
+                status=501,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        provided_key = body.get("api_key", "")
+        if provided_key != self._api_key:
+            return web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        import jwt as pyjwt
+        now = int(time.time())
+        access_jti = str(uuid.uuid4())
+        refresh_jti = str(uuid.uuid4())
+
+        access_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": now + 3600,
+             "jti": access_jti, "type": "access"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        refresh_exp = now + 30 * 24 * 3600
+        refresh_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": refresh_exp,
+             "jti": refresh_jti, "type": "refresh"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        self._response_store.store_refresh_token(refresh_jti, float(refresh_exp))
+
+        return web.json_response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })
+
+    async def _handle_auth_refresh(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/refresh - Exchange a refresh token for new token pair."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "No API key configured", "type": "server_error", "code": "no_api_key"}},
+                status=501,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        refresh_token_str = body.get("refresh_token", "")
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(refresh_token_str, self._jwt_secret, algorithms=["HS256"])
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Invalid or expired refresh token", "code": "invalid_token"}},
+                status=401,
+            )
+
+        if payload.get("type") != "refresh":
+            return web.json_response(
+                {"error": {"message": "Not a refresh token", "code": "invalid_token"}},
+                status=401,
+            )
+
+        jti = payload.get("jti", "")
+        if not self._response_store.is_refresh_token_valid(jti):
+            return web.json_response(
+                {"error": {"message": "Refresh token revoked or expired", "code": "token_revoked"}},
+                status=401,
+            )
+
+        # Rotate: revoke old refresh token, issue new pair
+        self._response_store.revoke_token(jti)
+
+        now = int(time.time())
+        new_access_jti = str(uuid.uuid4())
+        new_refresh_jti = str(uuid.uuid4())
+
+        access_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": now + 3600,
+             "jti": new_access_jti, "type": "access"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        refresh_exp = now + 30 * 24 * 3600
+        new_refresh_token = pyjwt.encode(
+            {"sub": "api_client", "iat": now, "exp": refresh_exp,
+             "jti": new_refresh_jti, "type": "refresh"},
+            self._jwt_secret,
+            algorithm="HS256",
+        )
+
+        self._response_store.store_refresh_token(new_refresh_jti, float(refresh_exp))
+
+        return web.json_response({
+            "access_token": access_token,
+            "refresh_token": new_refresh_token,
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })
+
+    async def _handle_auth_revoke(self, request: "web.Request") -> "web.Response":
+        """POST /api/auth/revoke - Revoke a refresh token (requires auth)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
+
+        refresh_token_str = body.get("refresh_token", "")
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(refresh_token_str, self._jwt_secret, algorithms=["HS256"])
+            jti = payload.get("jti", "")
+            self._response_store.revoke_token(jti)
+        except Exception:
+            pass  # Revoke is idempotent — ignore invalid tokens
+
+        return web.json_response({"revoked": True})
+
+    # ------------------------------------------------------------------
+    # Config Management
+    # ------------------------------------------------------------------
+
+    _SECRET_KEYS = frozenset({
+        "key", "api_key", "token", "password", "secret",
+        "webhook_url", "bot_token", "access_token", "refresh_token",
+    })
+
+    @staticmethod
+    def _redact_secrets(obj: Any) -> Any:
+        """Recursively redact secret fields in a config dict."""
+        if isinstance(obj, dict):
+            return {
+                k: "***" if k.lower() in APIServerAdapter._SECRET_KEYS else APIServerAdapter._redact_secrets(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [APIServerAdapter._redact_secrets(item) for item in obj]
+        return obj
+
+    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/config — return redacted config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            config = {}
+        except Exception as e:
+            return web.json_response(_openai_error(f"Failed to read config: {e}"), status=500)
+
+        return web.json_response({"config": self._redact_secrets(config)})
+
+    @staticmethod
+    def _apply_dot_notation(config: dict, updates: dict) -> dict:
+        """Apply flat dot-notation keys and nested dict updates to config."""
+        import copy
+        result = copy.deepcopy(config)
+        for key, value in updates.items():
+            if isinstance(value, dict) and "." not in key:
+                if key not in result or not isinstance(result[key], dict):
+                    result[key] = {}
+                result[key] = APIServerAdapter._apply_dot_notation(result[key], value)
+            elif "." in key:
+                parts = key.split(".", 1)
+                if parts[0] not in result or not isinstance(result[parts[0]], dict):
+                    result[parts[0]] = {}
+                result[parts[0]] = APIServerAdapter._apply_dot_notation(
+                    result[parts[0]], {parts[1]: value}
+                )
+            else:
+                result[key] = value
+        return result
+
+    async def _handle_patch_config(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/config — update config with dot-notation support."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            updates = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if not isinstance(updates, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+
+        from hermes_cli.config import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                current = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            current = {}
+
+        merged = self._apply_dot_notation(current, updates)
+
+        try:
+            import yaml
+            yaml.safe_dump(merged)
+        except Exception as e:
+            return web.json_response(_openai_error(f"Invalid config values: {e}"), status=400)
+
+        try:
+            from utils import atomic_yaml_write
+            atomic_yaml_write(config_path, merged)
+        except Exception as e:
+            return web.json_response(_openai_error(f"Failed to write config: {e}"), status=500)
+
+        return web.json_response({"config": self._redact_secrets(merged)})
+
+    # ------------------------------------------------------------------
+    # Memory Management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_memory_entries(content: str) -> list:
+        """Split §-delimited memory file into entries."""
+        return [e.strip() for e in content.split("§") if e.strip()]
+
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        """GET /api/memory — return memory and user entries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        hermes_home = get_hermes_home()
+        result = {}
+        for target, filename, char_limit in [
+            ("memory", "MEMORY.md", 2200),
+            ("user", "USER.md", 1375),
+        ]:
+            path = hermes_home / "memories" / filename
+            try:
+                content = path.read_text(encoding="utf-8") if path.exists() else ""
+            except Exception:
+                content = ""
+            entries = self._parse_memory_entries(content)
+            char_count = len(content)
+            result[target] = {
+                "entries": entries,
+                "char_count": char_count,
+                "char_limit": char_limit,
+                "usage_pct": round(char_count / char_limit * 100, 1),
+            }
+
+        return web.json_response(result)
+
+    async def _handle_patch_memory(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/memory and DELETE /api/memory/entry — add/replace/remove entries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        target = body.get("target")  # "memory" or "user"
+        action = body.get("action")  # "add", "replace", "remove"
+        content = body.get("content", "")
+        old_text = body.get("old_text", "")
+
+        if target not in ("memory", "user"):
+            return web.json_response(_openai_error("'target' must be 'memory' or 'user'"), status=400)
+        if action not in ("add", "replace", "remove"):
+            return web.json_response(_openai_error("'action' must be 'add', 'replace', or 'remove'"), status=400)
+
+        filename = "MEMORY.md" if target == "memory" else "USER.md"
+        char_limit = 2200 if target == "memory" else 1375
+        from hermes_cli.config import get_hermes_home
+        path = get_hermes_home() / "memories" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        entries = self._parse_memory_entries(current)
+
+        if action == "add":
+            if content and self._memory_security_scan(content):
+                return web.json_response(_openai_error("Content rejected by security scan", code="security_scan_rejected"), status=422)
+            new_content = current.rstrip() + ("\n§\n" if entries else "") + content
+            if len(new_content) > char_limit:
+                return web.json_response(_openai_error(
+                    f"Adding this entry would exceed the {char_limit} char limit",
+                    code="memory_limit_exceeded"
+                ), status=413)
+            path.write_text(new_content, encoding="utf-8")
+
+        elif action in ("replace", "remove"):
+            if not old_text:
+                return web.json_response(_openai_error("'old_text' required for replace/remove"), status=400)
+            matches = [e for e in entries if old_text in e]
+            if len(matches) == 0:
+                return web.json_response(_openai_error("No entry found matching 'old_text'", code="entry_not_found"), status=400)
+            if len(matches) > 1:
+                return web.json_response(_openai_error("'old_text' matches multiple entries — be more specific", code="ambiguous_match"), status=400)
+            if action == "replace":
+                if content and self._memory_security_scan(content):
+                    return web.json_response(_openai_error("Content rejected by security scan", code="security_scan_rejected"), status=422)
+                entries = [content if old_text in e else e for e in entries]
+            else:
+                entries = [e for e in entries if old_text not in e]
+            path.write_text("\n§\n".join(entries), encoding="utf-8")
+
+        updated = path.read_text(encoding="utf-8") if path.exists() else ""
+        updated_entries = self._parse_memory_entries(updated)
+        return web.json_response({
+            "success": True,
+            "target": target,
+            "entries": updated_entries,
+            "char_count": len(updated),
+            "char_limit": char_limit,
+        })
+
+    @staticmethod
+    def _memory_security_scan(content: str) -> bool:
+        """Returns True if content should be rejected. Reuse logic from memory_tool.py."""
+        try:
+            from tools.memory_tool import _scan_for_threats
+            return _scan_for_threats(content)
+        except ImportError:
+            return False
+
+    # ------------------------------------------------------------------
+    # Skills Management
+    # ------------------------------------------------------------------
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills — list installed skills."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+        category_filter = request.rel_url.query.get("category")
+        skills = []
+
+        if skills_dir.exists():
+            for skill_path in skills_dir.rglob("SKILL.md"):
+                skill = self._parse_skill_metadata(skill_path)
+                if category_filter and skill.get("category") != category_filter:
+                    continue
+                skills.append(skill)
+
+        skills.sort(key=lambda s: s["name"])
+        return web.json_response({"skills": skills, "total": len(skills)})
+
+    @staticmethod
+    def _parse_skill_metadata(skill_path) -> dict:
+        """Parse SKILL.md frontmatter for metadata."""
+        import re
+        content = skill_path.read_text(encoding="utf-8", errors="replace")
+        name = skill_path.parent.name
+        category = skill_path.parent.parent.name
+        description = ""
+        version = None
+
+        fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if fm_match:
+            try:
+                import yaml
+                fm = yaml.safe_load(fm_match.group(1)) or {}
+                description = fm.get("description", "")
+                version = fm.get("version")
+                name = fm.get("name", name)
+            except Exception:
+                pass
+
+        return {
+            "name": name,
+            "category": category,
+            "description": description,
+            "version": version,
+            "path": str(skill_path.parent),
+            "has_references": (skill_path.parent / "references").exists(),
+            "has_scripts": (skill_path.parent / "scripts").exists(),
+            "has_templates": (skill_path.parent / "templates").exists(),
+        }
+
+    async def _handle_get_skill(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills/{name} — get a specific skill."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+
+        for candidate in skills_dir.rglob("SKILL.md"):
+            if candidate.parent.name == name:
+                skill = self._parse_skill_metadata(candidate)
+                return web.json_response(skill)
+
+        return web.json_response(_openai_error("Skill not found", err_type="not_found_error"), status=404)
+
+    async def _handle_install_skill(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/install — install a skill from the hub."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        skill_id = body.get("skill", "").strip()
+        force = body.get("force", False)
+
+        if not skill_id:
+            return web.json_response(_openai_error("Missing 'skill' field"), status=400)
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: self._install_skill_sync(skill_id, force))
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response(_openai_error(str(e), err_type="install_error"), status=422)
+
+    @staticmethod
+    def _install_skill_sync(skill_id: str, force: bool) -> dict:
+        """Synchronous wrapper for skill installation."""
+        from hermes_cli.skills_hub import install_skill
+        return install_skill(skill_id, force=force)
+
+    async def _handle_delete_skill(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/skills/{name} — remove an installed skill."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        from hermes_cli.config import get_hermes_home
+        skills_dir = get_hermes_home() / "skills"
+
+        skill_path = None
+        for candidate in skills_dir.rglob("SKILL.md"):
+            if candidate.parent.name == name:
+                skill_path = candidate.parent
+                break
+
+        if skill_path is None:
+            return web.json_response(_openai_error("Skill not found", err_type="not_found_error"), status=404)
+
+        import shutil
+        shutil.rmtree(skill_path)
+        return web.Response(status=204)
+
+    async def _handle_check_skills(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/check — check for skill updates."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._check_skills_sync)
+        return web.json_response(result)
+
+    @staticmethod
+    def _check_skills_sync() -> dict:
+        """Synchronous wrapper for checking skill updates."""
+        try:
+            from hermes_cli.skills_hub import check_skill_updates
+            return check_skill_updates()
+        except Exception as e:
+            return {"error": str(e), "updates_available": [], "up_to_date": []}
+
+    async def _handle_update_skills(self, request: "web.Request") -> "web.Response":
+        """POST /api/skills/update — update skills."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        skills_filter = body.get("skills")  # None = update all
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: self._update_skills_sync(skills_filter))
+        return web.json_response(result)
+
+    @staticmethod
+    def _update_skills_sync(skills_filter: Optional[List[str]] = None) -> dict:
+        """Synchronous wrapper for updating skills."""
+        try:
+            from hermes_cli.skills_hub import update_skills
+            return update_skills(skills=skills_filter)
+        except Exception as e:
+            return {"error": str(e), "updated": [], "failed": []}
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -1433,113 +2032,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return await loop.run_in_executor(None, _run)
 
-
-    # ------------------------------------------------------------------
-    # Session Management Endpoints
-    # ------------------------------------------------------------------
-
-    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        limit = min(int(request.rel_url.query.get("limit", 20)), 100)
-        offset = int(request.rel_url.query.get("offset", 0))
-        source = request.rel_url.query.get("source")
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response({"sessions": [], "total": 0, "limit": limit, "offset": offset})
-        sessions, total = db.list_sessions(limit=limit, offset=offset, source=source)
-        return web.json_response({"sessions": sessions, "total": total, "limit": limit, "offset": offset})
-
-    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        q = request.rel_url.query.get("q", "").strip()
-        if not q:
-            return web.json_response(_openai_error("Missing query parameter 'q'"), status=400)
-        limit = min(int(request.rel_url.query.get("limit", 10)), 50)
-        source = request.rel_url.query.get("source")
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response({"results": [], "total": 0})
-        source_filter = [source] if source else None
-        results = db.search_messages(q, source_filter=source_filter, limit=limit)
-        return web.json_response({"results": results, "total": len(results)})
-
-    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response(_openai_error("Database unavailable", code="db_unavailable"), status=503)
-        session = db.get_session(session_id)
-        if session is None:
-            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
-        messages = db.get_messages_as_conversation(session_id)
-        return web.json_response({"session": session, "messages": messages})
-
-    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response(_openai_error("Database unavailable"), status=503)
-        if db.get_session(session_id) is None:
-            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
-        db.delete_session(session_id)
-        return web.Response(status=204)
-
-    async def _handle_export_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response(_openai_error("Database unavailable"), status=503)
-        if db.get_session(session_id) is None:
-            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
-        messages = db.get_messages(session_id)
-        cols = [d[0] for d in db._conn.description]
-        lines = [json.dumps(dict(zip(cols, row)), default=str) for row in messages]
-        body = "\n".join(lines)
-        return web.Response(
-            body=body,
-            content_type="application/x-ndjson",
-            headers={"Content-Disposition": f'attachment; filename="session-{session_id}.jsonl"'},
-        )
-
-    async def _handle_rename_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-        title = body.get("title", "").strip()
-        if not title:
-            return web.json_response(_openai_error("Missing 'title' field"), status=400)
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response(_openai_error("Database unavailable"), status=503)
-        if db.get_session(session_id) is None:
-            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
-        try:
-            db.set_session_title(session_id, title)
-        except Exception as e:
-            if "UNIQUE" in str(e):
-                return web.json_response(_openai_error("Title already in use", code="title_conflict"), status=409)
-            raise
-        session = db.get_session(session_id)
-        return web.json_response({"session": session})
-
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -1561,13 +2053,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            # Session management API
-            self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
-            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
-            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
-            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
-            self._app.router.add_get("/api/sessions/{session_id}/export", self._handle_export_session)
-            self._app.router.add_patch("/api/sessions/{session_id}", self._handle_rename_session)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -1579,6 +2064,29 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             # WebSocket agent communication
             self._app.router.add_get("/ws/agent", self._handle_ws_agent)
+
+
+            # JWT Auth endpoints
+            self._app.router.add_post("/api/auth/token", self._handle_auth_token)
+            self._app.router.add_post("/api/auth/refresh", self._handle_auth_refresh)
+            self._app.router.add_post("/api/auth/revoke", self._handle_auth_revoke)
+
+            # Config management
+            self._app.router.add_get("/api/config", self._handle_get_config)
+            self._app.router.add_patch("/api/config", self._handle_patch_config)
+
+            # Memory management
+            self._app.router.add_get("/api/memory", self._handle_get_memory)
+            self._app.router.add_patch("/api/memory", self._handle_patch_memory)
+            self._app.router.add_delete("/api/memory/entry", self._handle_patch_memory)
+
+            # Skills management (literals BEFORE /api/skills/{name})
+            self._app.router.add_get("/api/skills", self._handle_list_skills)
+            self._app.router.add_get("/api/skills/{name}", self._handle_get_skill)
+            self._app.router.add_post("/api/skills/install", self._handle_install_skill)
+            self._app.router.add_post("/api/skills/check", self._handle_check_skills)
+            self._app.router.add_post("/api/skills/update", self._handle_update_skills)
+            self._app.router.add_delete("/api/skills/{name}", self._handle_delete_skill)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket
