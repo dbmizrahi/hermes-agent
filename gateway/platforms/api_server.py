@@ -1445,6 +1445,158 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         return items
 
+
+    async def _handle_ws_agent(self, request):
+        """GET /ws/agent -- WebSocket endpoint for real-time agent communication."""
+        token = request.query.get("token", "")
+        if self._api_key and token != self._api_key:
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json({"type": "error", "message": "Invalid API key"})
+            await ws.close()
+            return ws
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        connection_id = str(uuid.uuid4())[:8]
+        logger.info("[%s] WebSocket agent connection established: %s", self.name, connection_id)
+
+        try:
+            msg = await ws.receive()
+            if msg.type != web.WSMsgType.TEXT:
+                await ws.close()
+                return ws
+
+            try:
+                payload = json.loads(msg.data)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "message": "Invalid JSON"})
+                await ws.close()
+                return ws
+
+            if payload.get("type") != "message" or not payload.get("content"):
+                await ws.send_json({"type": "error", "message": "Expected {type: message, content: ...}"})
+                await ws.close()
+                return ws
+
+            user_message = payload["content"]
+            session_id = payload.get("session_id") or str(uuid.uuid4())
+            tool_events = payload.get("tool_events", False)
+            history = []
+
+            if payload.get("session_id"):
+                try:
+                    db = self._ensure_session_db()
+                    if db is not None:
+                        history = db.get_messages_as_conversation(session_id)
+                except Exception as e:
+                    logger.warning("Failed to load session %s: %s", session_id, e)
+
+            output_queue = asyncio.Queue()
+            agent_ref = [None]
+
+            agent_task = asyncio.ensure_future(
+                self._ws_run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    session_id=session_id,
+                    output_queue=output_queue,
+                    agent_ref=agent_ref,
+                    tool_events=tool_events,
+                )
+            )
+
+            try:
+                while True:
+                    client_fut = asyncio.ensure_future(ws.receive())
+                    queue_fut = asyncio.ensure_future(output_queue.get())
+                    done, pending = await asyncio.wait(
+                        [client_fut, queue_fut], return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for f in pending:
+                        f.cancel()
+                    if client_fut in done:
+                        m = client_fut.result()
+                        if m.type == web.WSMsgType.TEXT:
+                            try:
+                                d = json.loads(m.data)
+                                if d.get("type") == "interrupt" and agent_ref[0]:
+                                    agent_ref[0].interrupt("Client requested interrupt")
+                            except Exception:
+                                pass
+                        elif m.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR, web.WSMsgType.CLOSING):
+                            if agent_ref[0]:
+                                agent_ref[0].interrupt("WebSocket client disconnected")
+                            break
+                    elif queue_fut in done:
+                        item = queue_fut.result()
+                        if item is None:
+                            break
+                        await ws.send_json(item)
+            except asyncio.CancelledError:
+                pass
+
+            if not agent_task.done():
+                try:
+                    await agent_task
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("[%s] WebSocket agent handler error: %s", self.name, e, exc_info=True)
+            try:
+                await ws.send_json({"type": "error", "message": str(e)})
+            except Exception:
+                pass
+        finally:
+            try:
+                if not ws.closed:
+                    await ws.close()
+            except Exception:
+                pass
+        return ws
+
+    async def _ws_run_agent(
+        self, user_message, conversation_history, session_id,
+        output_queue, agent_ref, tool_events=False,
+    ):
+        """Run AIAgent with streaming callbacks via async queue."""
+        try:
+            def _on_delta(delta):
+                if delta is not None:
+                    try:
+                        output_queue.put_nowait({"type": "delta", "content": delta})
+                    except asyncio.QueueFull:
+                        pass
+
+            def _on_tool_progress(name, preview, args_obj):
+                if not tool_events or name.startswith("_"):
+                    return
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+                try:
+                    output_queue.put_nowait({"type": "tool_progress", "name": name, "preview": preview or "", "emoji": emoji})
+                except asyncio.QueueFull:
+                    pass
+
+            def _blocking_run():
+                agent = self._create_agent(session_id=session_id, stream_delta_callback=_on_delta, tool_progress_callback=_on_tool_progress)
+                agent_ref[0] = agent
+                result = agent.run_conversation(user_message=user_message, conversation_history=conversation_history)
+                return {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0, "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0, "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
+
+            loop = asyncio.get_event_loop()
+            usage = await loop.run_in_executor(None, _blocking_run)
+            output_queue.put_nowait({"type": "done", "session_id": session_id, "usage": usage})
+            output_queue.put_nowait(None)
+        except Exception as e:
+            logger.error("[%s] WebSocket agent run error: %s", self.name, e, exc_info=True)
+            try:
+                output_queue.put_nowait({"type": "error", "message": str(e)})
+                output_queue.put_nowait(None)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Agent execution
     # ------------------------------------------------------------------
@@ -1524,6 +1676,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # WebSocket agent communication
+            self._app.router.add_get("/ws/agent", self._handle_ws_agent)
 
 
             # JWT Auth endpoints
