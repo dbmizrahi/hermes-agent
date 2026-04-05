@@ -1433,6 +1433,113 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return await loop.run_in_executor(None, _run)
 
+
+    # ------------------------------------------------------------------
+    # Session Management Endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        limit = min(int(request.rel_url.query.get("limit", 20)), 100)
+        offset = int(request.rel_url.query.get("offset", 0))
+        source = request.rel_url.query.get("source")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"sessions": [], "total": 0, "limit": limit, "offset": offset})
+        sessions, total = db.list_sessions(limit=limit, offset=offset, source=source)
+        return web.json_response({"sessions": sessions, "total": total, "limit": limit, "offset": offset})
+
+    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        q = request.rel_url.query.get("q", "").strip()
+        if not q:
+            return web.json_response(_openai_error("Missing query parameter 'q'"), status=400)
+        limit = min(int(request.rel_url.query.get("limit", 10)), 50)
+        source = request.rel_url.query.get("source")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"results": [], "total": 0})
+        source_filter = [source] if source else None
+        results = db.search_messages(q, source_filter=source_filter, limit=limit)
+        return web.json_response({"results": results, "total": len(results)})
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable", code="db_unavailable"), status=503)
+        session = db.get_session(session_id)
+        if session is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        messages = db.get_messages_as_conversation(session_id)
+        return web.json_response({"session": session, "messages": messages})
+
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        db.delete_session(session_id)
+        return web.Response(status=204)
+
+    async def _handle_export_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        messages = db.get_messages(session_id)
+        cols = [d[0] for d in db._conn.description]
+        lines = [json.dumps(dict(zip(cols, row)), default=str) for row in messages]
+        body = "\n".join(lines)
+        return web.Response(
+            body=body,
+            content_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="session-{session_id}.jsonl"'},
+        )
+
+    async def _handle_rename_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        title = body.get("title", "").strip()
+        if not title:
+            return web.json_response(_openai_error("Missing 'title' field"), status=400)
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        try:
+            db.set_session_title(session_id, title)
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                return web.json_response(_openai_error("Title already in use", code="title_conflict"), status=409)
+            raise
+        session = db.get_session(session_id)
+        return web.json_response({"session": session})
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -1454,6 +1561,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Session management API
+            self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_get("/api/sessions/{session_id}/export", self._handle_export_session)
+            self._app.router.add_patch("/api/sessions/{session_id}", self._handle_rename_session)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
