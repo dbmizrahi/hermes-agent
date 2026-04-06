@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -342,6 +343,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._jwt_secret: Optional[bytes] = (
             self._derive_jwt_secret(self._api_key) if self._api_key else None
         )
+        self._start_time: float = time.time()
 
     @staticmethod
     def _derive_jwt_secret(api_key: str) -> bytes:
@@ -911,6 +913,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 description = fm.get("description", "")
                 version = fm.get("version")
                 name = fm.get("name", name)
+                if "category" in fm:
+                    category = fm["category"]
             except Exception:
                 pass
 

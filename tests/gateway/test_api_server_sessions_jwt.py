@@ -400,12 +400,21 @@ class TestAuthRevoke:
     @pytest.mark.asyncio
     async def test_auth_revoke_invalid_json(self, auth_adapter):
         """POST /api/auth/revoke with non-JSON body returns 400."""
-        app = _create_app(auth_jwt_routes=True, adapter=auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
+        # Get a valid access token first (revoke calls _check_auth before parsing body)
+        token_app = _create_app(auth_jwt_routes=True, adapter=auth_adapter)
+        async with TestClient(TestServer(token_app)) as cli:
+            token_resp = await cli.post("/api/auth/token", json={"api_key": API_KEY})
+            access_token = (await token_resp.json())["access_token"]
+        # Now send invalid JSON body with valid auth
+        revoke_app = _create_app(auth_jwt_routes=True, adapter=auth_adapter)
+        async with TestClient(TestServer(revoke_app)) as cli:
             resp = await cli.post(
                 "/api/auth/revoke",
                 data="garbage",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {access_token}",
+                },
             )
             assert resp.status == 400
 
