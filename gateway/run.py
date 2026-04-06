@@ -1180,6 +1180,14 @@ class GatewayRunner:
             logger.warning("No messaging platforms enabled.")
             logger.info("Gateway will continue running for cron job execution.")
         
+        # Wire gateway_runner into the API server's aiohttp app
+        # so that management endpoints can access platform state
+        if Platform.API_SERVER in self.adapters:
+            api_adapter = self.adapters[Platform.API_SERVER]
+            app = getattr(api_adapter, "_app", None)
+            if app is not None:
+                app["gateway_runner"] = self
+
         # Update delivery router with adapters
         self.delivery_router.adapters = self.adapters
         
