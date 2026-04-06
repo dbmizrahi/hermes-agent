@@ -2032,6 +2032,895 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return await loop.run_in_executor(None, _run)
 
+
+    # ------------------------------------------------------------------
+    # Session Management Endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        limit = min(int(request.rel_url.query.get("limit", 20)), 100)
+        offset = int(request.rel_url.query.get("offset", 0))
+        source = request.rel_url.query.get("source")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"sessions": [], "total": 0, "limit": limit, "offset": offset})
+        sessions, total = db.list_sessions(limit=limit, offset=offset, source=source)
+        return web.json_response({"sessions": sessions, "total": total, "limit": limit, "offset": offset})
+
+    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        q = request.rel_url.query.get("q", "").strip()
+        if not q:
+            return web.json_response(_openai_error("Missing query parameter 'q'"), status=400)
+        limit = min(int(request.rel_url.query.get("limit", 10)), 50)
+        source = request.rel_url.query.get("source")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"results": [], "total": 0})
+        source_filter = [source] if source else None
+        results = db.search_messages(q, source_filter=source_filter, limit=limit)
+        return web.json_response({"results": results, "total": len(results)})
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable", code="db_unavailable"), status=503)
+        session = db.get_session(session_id)
+        if session is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        messages = db.get_messages_as_conversation(session_id)
+        return web.json_response({"session": session, "messages": messages})
+
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        db.delete_session(session_id)
+        return web.Response(status=204)
+
+    async def _handle_export_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        messages = db.get_messages(session_id)
+        cols = [d[0] for d in db._conn.description]
+        lines = [json.dumps(dict(zip(cols, row)), default=str) for row in messages]
+        body = "\n".join(lines)
+        return web.Response(
+            body=body,
+            content_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="session-{session_id}.jsonl"'},
+        )
+
+    async def _handle_rename_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        title = body.get("title", "").strip()
+        if not title:
+            return web.json_response(_openai_error("Missing 'title' field"), status=400)
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+        if db.get_session(session_id) is None:
+            return web.json_response(_openai_error("Session not found", err_type="not_found_error", code="session_not_found"), status=404)
+        try:
+            db.set_session_title(session_id, title)
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                return web.json_response(_openai_error("Title already in use", code="title_conflict"), status=409)
+            raise
+        session = db.get_session(session_id)
+        return web.json_response({"session": session})
+
+
+    # Cron History & Output API
+    # ------------------------------------------------------------------
+
+    async def _handle_job_history(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/history — list run output files for a job."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        job_id = request.match_info["job_id"]
+        if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+            return web.json_response(_openai_error("Invalid job ID format"), status=400)
+
+        limit = min(int(request.rel_url.query.get("limit", 20)), 100)
+        offset = int(request.rel_url.query.get("offset", 0))
+
+        try:
+            from hermes_cli.config import get_hermes_home
+            output_dir = get_hermes_home() / "cron" / "output" / job_id
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        if not output_dir.exists():
+            job = self._cron_get(job_id) if self._CRON_AVAILABLE else None
+            if job is None:
+                return web.json_response(_openai_error("Job not found", err_type="not_found_error"), status=404)
+            return web.json_response({
+                "job_id": job_id,
+                "job_name": job.get("name", ""),
+                "runs": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            })
+
+        run_files = sorted(output_dir.glob("*.md"), key=lambda p: p.stem, reverse=True)
+        total = len(run_files)
+        page = run_files[offset:offset + limit]
+
+        job = self._cron_get(job_id) or {} if self._CRON_AVAILABLE else {}
+        runs = [
+            {
+                "run_id": f.stem,
+                "started_at": f.stem.replace("_", "T", 1).replace("_", ":").replace("T", " ", 1),
+                "size_bytes": f.stat().st_size,
+                "status": "success",
+            }
+            for f in page
+        ]
+
+        return web.json_response({
+            "job_id": job_id,
+            "job_name": job.get("name", ""),
+            "runs": runs,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
+
+    async def _handle_job_output(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/output/{run_id} — get run output content."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        job_id = request.match_info["job_id"]
+        run_id = request.match_info["run_id"]
+
+        if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+            return web.json_response(_openai_error("Invalid job ID format"), status=400)
+        if not re.fullmatch(r"\d{8}_\d{6}", run_id):
+            return web.json_response(_openai_error("Invalid run ID format"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+            output_file = get_hermes_home() / "cron" / "output" / job_id / f"{run_id}.md"
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        if not output_file.exists():
+            return web.json_response(_openai_error("Run output not found", err_type="not_found_error"), status=404)
+
+        text = output_file.read_text(encoding="utf-8", errors="replace")
+        return web.Response(body=text, content_type="text/markdown")
+
+    async def _handle_all_outputs(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/output — list all run outputs across jobs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        limit = min(int(request.rel_url.query.get("limit", 20)), 100)
+        offset = int(request.rel_url.query.get("offset", 0))
+        job_id_filter = request.rel_url.query.get("job_id")
+
+        try:
+            from hermes_cli.config import get_hermes_home
+            output_base = get_hermes_home() / "cron" / "output"
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        all_runs = []
+
+        if output_base.exists():
+            jobs_map = {}
+            if self._CRON_AVAILABLE:
+                try:
+                    jobs_list = self._cron_list()
+                    jobs_map = {j["id"]: j.get("name", "") for j in jobs_list}
+                except Exception:
+                    pass
+
+            for job_dir in output_base.iterdir():
+                if not job_dir.is_dir():
+                    continue
+                if job_id_filter and job_dir.name != job_id_filter:
+                    continue
+                for run_file in job_dir.glob("*.md"):
+                    all_runs.append({
+                        "run_id": run_file.stem,
+                        "job_id": job_dir.name,
+                        "job_name": jobs_map.get(job_dir.name, ""),
+                        "started_at": run_file.stem.replace("_", " ", 1),
+                        "size_bytes": run_file.stat().st_size,
+                    })
+
+        all_runs.sort(key=lambda r: r["run_id"], reverse=True)
+        total = len(all_runs)
+        page = all_runs[offset:offset + limit]
+
+        return web.json_response({"runs": page, "total": total, "limit": limit, "offset": offset})
+
+    # ------------------------------------------------------------------
+
+    # Gateway & Platform Management API
+    # ------------------------------------------------------------------
+
+    async def _handle_gateway_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/gateway/status — return gateway status and platform info."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        runner = request.app.get("gateway_runner")
+        uptime = int(time.time() - self._start_time)
+
+        platforms = []
+        if runner:
+            for adapter in runner.adapters.values():
+                platforms.append({
+                    "name": getattr(adapter, "name", "unknown"),
+                    "type": adapter.platform.value if hasattr(adapter, "platform") else "unknown",
+                    "connected": adapter.is_connected,
+                    "connected_since": getattr(adapter, "_connected_since", None),
+                    "error": getattr(adapter, "_last_error", None),
+                })
+
+        try:
+            from hermes_constants import __version__
+            version = __version__
+        except ImportError:
+            version = "unknown"
+
+        active_sessions = 0
+        db = self._ensure_session_db()
+        if db:
+            try:
+                active_sessions = db._conn.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+                ).fetchone()[0]
+            except Exception:
+                pass
+
+        return web.json_response({
+            "status": "running",
+            "uptime_seconds": uptime,
+            "version": version,
+            "model": os.getenv("HERMES_MODEL", ""),
+            "active_sessions": active_sessions,
+            "platforms": platforms,
+        })
+
+    async def _handle_list_platforms(self, request: "web.Request") -> "web.Response":
+        """GET /api/gateway/platforms — list all configured platforms."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        runner = request.app.get("gateway_runner")
+        if runner is None:
+            return web.json_response({"platforms": []})
+
+        platforms = []
+        for adapter in runner.adapters.values():
+            config_dict = {}
+            if hasattr(adapter, "_config") and adapter._config:
+                config_dict = self._redact_secrets(adapter._config.extra or {})
+            platforms.append({
+                "name": getattr(adapter, "name", "unknown"),
+                "type": adapter.platform.value if hasattr(adapter, "platform") else "unknown",
+                "connected": adapter.is_connected,
+                "config": config_dict,
+            })
+
+        return web.json_response({"platforms": platforms})
+
+    async def _handle_connect_platform(self, request: "web.Request") -> "web.Response":
+        """POST /api/gateway/platforms/{name}/connect — connect a platform."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        runner = request.app.get("gateway_runner")
+        if runner is None:
+            return web.json_response(_openai_error("Gateway runner not available"), status=503)
+
+        adapter = None
+        for a in runner.adapters.values():
+            if getattr(a, "name", None) == name:
+                adapter = a
+                break
+        if adapter is None:
+            return web.json_response(_openai_error("Platform not found", err_type="not_found_error"), status=404)
+
+        if adapter.is_connected:
+            return web.json_response(_openai_error("Platform already connected", code="already_connected"), status=409)
+
+        success = await adapter.connect()
+        if not success:
+            return web.json_response(
+                _openai_error(f"Failed to connect platform '{name}'", err_type="connection_error"),
+                status=502,
+            )
+
+        return web.json_response({"name": name, "connected": True})
+
+    async def _handle_disconnect_platform(self, request: "web.Request") -> "web.Response":
+        """POST /api/gateway/platforms/{name}/disconnect — disconnect a platform."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        runner = request.app.get("gateway_runner")
+        if runner is None:
+            return web.json_response(_openai_error("Gateway runner not available"), status=503)
+
+        adapter = None
+        for a in runner.adapters.values():
+            if getattr(a, "name", None) == name:
+                adapter = a
+                break
+        if adapter is None:
+            return web.json_response(_openai_error("Platform not found", err_type="not_found_error"), status=404)
+
+        if not adapter.is_connected:
+            return web.json_response(_openai_error("Platform already disconnected", code="already_disconnected"), status=409)
+
+        await adapter.disconnect()
+        return web.json_response({"name": name, "connected": False})
+
+    async def _handle_add_platform(self, request: "web.Request") -> "web.Response":
+        """POST /api/gateway/platforms — add a new platform."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        name = body.get("name", "").strip()
+        platform_type = body.get("type", "").strip()
+        config = body.get("config", {})
+        do_connect = body.get("connect", True)
+
+        if not name or not platform_type:
+            return web.json_response(_openai_error("'name' and 'type' are required"), status=400)
+
+        runner = request.app.get("gateway_runner")
+        if runner:
+            for a in runner.adapters.values():
+                if getattr(a, "name", None) == name:
+                    return web.json_response(_openai_error("Platform name already exists", code="name_conflict"), status=409)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        cfg.setdefault("platforms", {})[name] = {"type": platform_type, **config}
+        atomic_yaml_write(config_path, cfg)
+
+        if do_connect and runner:
+            try:
+                from gateway.config import Platform, PlatformConfig
+                from gateway.run import _create_adapter
+                platform_enum = Platform(platform_type)
+                pc = PlatformConfig(enabled=True, extra=config)
+                adapter = _create_adapter(platform_enum, pc, name)
+                if adapter:
+                    runner.adapters[platform_enum] = adapter
+                    success = await adapter.connect()
+                    return web.json_response({
+                        "name": name, "type": platform_type,
+                        "connected": success,
+                        "config": self._redact_secrets(config),
+                    })
+            except Exception as e:
+                return web.json_response(_openai_error(f"Config saved but connection failed: {e}", code="connect_failed"), status=502)
+
+        return web.json_response({"name": name, "type": platform_type, "connected": False, "config": self._redact_secrets(config)})
+
+    async def _handle_update_platform(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/gateway/platforms/{name} — update platform config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        plat_config = cfg.get("platforms", {}).get(name)
+        if plat_config is None:
+            return web.json_response(_openai_error("Platform not found", err_type="not_found_error"), status=404)
+
+        plat_config.update(body)
+        cfg["platforms"][name] = plat_config
+        atomic_yaml_write(config_path, cfg)
+
+        return web.json_response({"name": name, "config": self._redact_secrets(plat_config)})
+
+    async def _handle_remove_platform(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/gateway/platforms/{name} — remove a platform."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        plat_config = cfg.get("platforms", {}).get(name)
+        if plat_config is None:
+            return web.json_response(_openai_error("Platform not found", err_type="not_found_error"), status=404)
+
+        del cfg["platforms"][name]
+        atomic_yaml_write(config_path, cfg)
+
+        # Disconnect and remove from running runner if present
+        runner = request.app.get("gateway_runner")
+        if runner:
+            to_remove = []
+            for p, a in runner.adapters.items():
+                if getattr(a, "name", None) == name:
+                    to_remove.append(p)
+            for p in to_remove:
+                adapter = runner.adapters.pop(p)
+                try:
+                    await adapter.disconnect()
+                except Exception:
+                    pass
+
+        return web.json_response({"name": name, "removed": True})
+
+    # ------------------------------------------------------------------
+
+    # Tools & MCP Management API
+    # ------------------------------------------------------------------
+
+    async def _handle_list_tools(self, request: "web.Request") -> "web.Response":
+        """GET /api/tools — list all registered tools with enabled status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        toolset_filter = request.rel_url.query.get("toolset")
+        enabled_filter = request.rel_url.query.get("enabled")
+
+        from model_tools import get_all_tool_names, TOOL_TO_TOOLSET_MAP
+        from tools.registry import registry as tool_registry
+
+        try:
+            from gateway.run import _load_gateway_config
+            user_config = _load_gateway_config()
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_tools = _get_platform_tools(user_config, "api_server")
+        except Exception:
+            enabled_tools = set()
+
+        all_names = get_all_tool_names()
+        tools = []
+        for tname in all_names:
+            toolset = TOOL_TO_TOOLSET_MAP.get(tname, "unknown")
+            is_enabled = tname in enabled_tools
+
+            if toolset_filter and toolset != toolset_filter:
+                continue
+            if enabled_filter is not None:
+                if enabled_filter.lower() == "true" and not is_enabled:
+                    continue
+                if enabled_filter.lower() == "false" and is_enabled:
+                    continue
+
+            entry = tool_registry._tools.get(tname)
+            description = ""
+            requires_env = []
+            if entry:
+                description = (entry.description or "")[:200]
+                requires_env = entry.requires_env or []
+
+            tools.append({
+                "name": tname,
+                "toolset": toolset,
+                "description": description,
+                "enabled": is_enabled,
+                "requires_env": requires_env,
+            })
+
+        tools.sort(key=lambda t: (t["toolset"], t["name"]))
+        enabled_count = sum(1 for t in tools if t["enabled"])
+        return web.json_response({"tools": tools, "total": len(tools), "enabled_count": enabled_count})
+
+    async def _handle_patch_tool(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/tools/{name} — enable/disable a tool."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        enabled = body.get("enabled")
+        if enabled is None:
+            return web.json_response(_openai_error("Missing 'enabled' field"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        cfg.setdefault("platform_toolsets", {}).setdefault("api_server", {})
+        cfg["platform_toolsets"]["api_server"][name] = enabled
+        atomic_yaml_write(config_path, cfg)
+
+        return web.json_response({"name": name, "enabled": enabled})
+
+    async def _handle_list_toolsets(self, request: "web.Request") -> "web.Response":
+        """GET /api/tools/toolsets — list all toolsets with enabled status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from toolsets import TOOLSETS
+            from gateway.run import _load_gateway_config
+            user_config = _load_gateway_config()
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_tools = _get_platform_tools(user_config, "api_server")
+        except Exception:
+            return web.json_response({"toolsets": []})
+
+        toolsets = []
+        for ts_name, ts_def in TOOLSETS.items():
+            tools_in_ts = [t for t in ts_def.get("tools", [])]
+            enabled_in_ts = [t for t in tools_in_ts if t in enabled_tools]
+            toolsets.append({
+                "name": ts_name,
+                "description": ts_def.get("description", ""),
+                "tools": tools_in_ts,
+                "enabled": len(enabled_in_ts) > 0,
+                "tool_count": len(tools_in_ts),
+                "enabled_tool_count": len(enabled_in_ts),
+            })
+
+        return web.json_response({"toolsets": toolsets})
+
+    async def _handle_patch_toolset(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/tools/toolsets/{name} — enable/disable a toolset."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        enabled = body.get("enabled")
+        if enabled is None:
+            return web.json_response(_openai_error("Missing 'enabled' field"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        cfg.setdefault("platform_toolsets", {}).setdefault("api_server", {})
+        cfg["platform_toolsets"]["api_server"][name] = enabled
+        atomic_yaml_write(config_path, cfg)
+
+        return web.json_response({"name": name, "enabled": enabled})
+
+    async def _handle_list_mcp(self, request: "web.Request") -> "web.Response":
+        """GET /api/mcp — list MCP server configurations."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            cfg = {}
+
+        mcp_servers = cfg.get("mcp_servers", {})
+        servers = []
+        for server_name, server_cfg in mcp_servers.items():
+            servers.append({
+                "name": server_name,
+                "type": "http" if server_cfg.get("url") else "stdio",
+                "command": server_cfg.get("command"),
+                "args": server_cfg.get("args", []),
+                "url": server_cfg.get("url"),
+                "enabled": server_cfg.get("enabled", True),
+                "tools_filter": server_cfg.get("tools_filter"),
+                "connected": False,
+            })
+
+        return web.json_response({"servers": servers})
+
+    async def _handle_add_mcp(self, request: "web.Request") -> "web.Response":
+        """POST /api/mcp — add an MCP server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        reload_param = request.rel_url.query.get("reload", "false").lower() == "true"
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        name = body.get("name", "").strip()
+        if not name:
+            return web.json_response(_openai_error("Missing 'name' field"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        if name in cfg.get("mcp_servers", {}):
+            return web.json_response(_openai_error("MCP server name already exists", code="name_conflict"), status=409)
+
+        server_cfg = {k: v for k, v in body.items() if k != "name"}
+        cfg.setdefault("mcp_servers", {})[name] = server_cfg
+        atomic_yaml_write(config_path, cfg)
+
+        result = {"name": name, "connected": False}
+        if reload_param:
+            try:
+                loop = asyncio.get_event_loop()
+                tool_count = await loop.run_in_executor(None, lambda: self._reload_mcp_server_sync(name, server_cfg))
+                result["connected"] = True
+                result["tool_count"] = tool_count
+            except Exception as e:
+                result["reload_error"] = str(e)
+
+        return web.json_response(result, status=201)
+
+    async def _handle_patch_mcp(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/mcp/{name} — update MCP server config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        server_cfg = cfg.get("mcp_servers", {}).get(name)
+        if server_cfg is None:
+            return web.json_response(_openai_error("MCP server not found", err_type="not_found_error"), status=404)
+
+        server_cfg.update(body)
+        cfg["mcp_servers"][name] = server_cfg
+        atomic_yaml_write(config_path, cfg)
+
+        return web.json_response({"name": name, "config": self._redact_secrets(server_cfg)})
+
+    async def _handle_delete_mcp(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/mcp/{name} — remove an MCP server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        from utils import atomic_yaml_write
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        if name not in cfg.get("mcp_servers", {}):
+            return web.json_response(_openai_error("MCP server not found", err_type="not_found_error"), status=404)
+
+        del cfg["mcp_servers"][name]
+        atomic_yaml_write(config_path, cfg)
+
+        return web.json_response({"name": name, "removed": True})
+
+    async def _handle_reload_mcp(self, request: "web.Request") -> "web.Response":
+        """POST /api/mcp/{name}/reload — reload an MCP server connection."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info["name"]
+
+        try:
+            from hermes_cli.config import get_hermes_home
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        config_path = get_hermes_home() / "config.yaml"
+        import yaml
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        server_cfg = cfg.get("mcp_servers", {}).get(name)
+        if server_cfg is None:
+            return web.json_response(_openai_error("MCP server not found", err_type="not_found_error"), status=404)
+
+        try:
+            loop = asyncio.get_event_loop()
+            tool_count = await loop.run_in_executor(None, lambda: self._reload_mcp_server_sync(name, server_cfg))
+            return web.json_response({"name": name, "connected": True, "tool_count": tool_count})
+        except Exception as e:
+            return web.json_response(_openai_error(f"Reload failed: {e}", err_type="connection_error"), status=502)
+
+    @staticmethod
+    def _reload_mcp_server_sync(name: str, server_cfg: dict) -> int:
+        """Disconnect and reconnect an MCP server. Returns tool count."""
+        try:
+            from tools.mcp_tool import reload_mcp_server
+            return reload_mcp_server(name, server_cfg)
+        except ImportError:
+            raise RuntimeError("MCP tool not available")
+
+    # ------------------------------------------------------------------
+    # Output extraction helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_output_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Build the full output item array from the agent's messages.
+
+        Walks *result["messages"]* and emits:
+        - ``function_call`` items for each tool_call on assistant messages
+        - ``function_call_output`` items for each tool-role message
+        - a final ``message`` item with the assistant's text reply
+        """
+        items: List[Dict[str, Any]] = []
+        messages = result.get("messages", [])
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    items.append({
+                        "type": "function_call",
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", ""),
+                        "call_id": tc.get("id", ""),
+                    })
+            elif role == "tool":
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id", ""),
+                    "output": msg.get("content", ""),
+                })
+
+        # Final assistant message
+        final = result.get("final_response", "")
+        if not final:
+            final = result.get("error", "(No response generated)")
+
+        items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": final,
+                }
+            ],
+        })
+        return items
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -2053,6 +2942,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Session management API
+            self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_get("/api/sessions/{session_id}/export", self._handle_export_session)
+            self._app.router.add_patch("/api/sessions/{session_id}", self._handle_rename_session)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -2087,6 +2983,31 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/skills/check", self._handle_check_skills)
             self._app.router.add_post("/api/skills/update", self._handle_update_skills)
             self._app.router.add_delete("/api/skills/{name}", self._handle_delete_skill)
+
+            # Cron history & output API — /api/jobs/output before {job_id} routes
+            self._app.router.add_get("/api/jobs/output", self._handle_all_outputs)
+            self._app.router.add_get("/api/jobs/{job_id}/history", self._handle_job_history)
+            self._app.router.add_get("/api/jobs/{job_id}/output/{run_id}", self._handle_job_output)
+
+            # Gateway & platform management
+            self._app.router.add_get("/api/gateway/status", self._handle_gateway_status)
+            self._app.router.add_get("/api/gateway/platforms", self._handle_list_platforms)
+            self._app.router.add_post("/api/gateway/platforms", self._handle_add_platform)
+            self._app.router.add_post("/api/gateway/platforms/{name}/connect", self._handle_connect_platform)
+            self._app.router.add_post("/api/gateway/platforms/{name}/disconnect", self._handle_disconnect_platform)
+            self._app.router.add_patch("/api/gateway/platforms/{name}", self._handle_update_platform)
+            self._app.router.add_delete("/api/gateway/platforms/{name}", self._handle_remove_platform)
+
+            # Tools & MCP management — literal paths before {name} params
+            self._app.router.add_get("/api/tools", self._handle_list_tools)
+            self._app.router.add_get("/api/tools/toolsets", self._handle_list_toolsets)
+            self._app.router.add_patch("/api/tools/toolsets/{name}", self._handle_patch_toolset)
+            self._app.router.add_patch("/api/tools/{name}", self._handle_patch_tool)
+            self._app.router.add_get("/api/mcp", self._handle_list_mcp)
+            self._app.router.add_post("/api/mcp", self._handle_add_mcp)
+            self._app.router.add_post("/api/mcp/{name}/reload", self._handle_reload_mcp)
+            self._app.router.add_patch("/api/mcp/{name}", self._handle_patch_mcp)
+            self._app.router.add_delete("/api/mcp/{name}", self._handle_delete_mcp)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket
