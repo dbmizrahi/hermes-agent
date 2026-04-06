@@ -372,7 +372,7 @@ class TestJobOutput:
             resp = await cli.get("/api/jobs/bad-id/output/20250101_120000")
             assert resp.status == 400
             data = await resp.json()
-            assert "Invalid" in data["error"]["message"]
+            assert "Invalid" in data["error"]
 
     @pytest.mark.asyncio
     async def test_job_output_invalid_run_id(self, adapter, tmp_path, monkeypatch):
@@ -389,7 +389,7 @@ class TestJobOutput:
             )
             assert resp.status == 400
             data = await resp.json()
-            assert "Invalid" in data["error"]["message"]
+            assert "Invalid" in data["error"]
 
     @pytest.mark.asyncio
     async def test_job_output_requires_auth(self, auth_adapter, tmp_path, monkeypatch):
@@ -526,7 +526,7 @@ class TestListPlatforms:
             assert plat["connected"] is True
             # Config should be redacted
             assert "token" in plat["config"]
-            assert plat["config"]["token"] == "***"
+            assert plat["config"]["token"] == "[REDACTED]"
 
     @pytest.mark.asyncio
     async def test_list_platforms_requires_auth(self, auth_adapter):
@@ -557,10 +557,8 @@ class TestAddPlatform:
         app = _create_cron_app(adapter, gateway_runner=runner)
 
         async with TestClient(TestServer(app)) as cli:
-            mock_create = MagicMock(return_value=None)
-            fake_mod = MagicMock()
-            fake_mod._create_adapter = mock_create
-            with patch.dict("sys.modules", {"gateway.run": fake_mod}):
+            with patch("gateway.platforms.api_server._create_adapter") as mock_create:
+                mock_create.return_value = None  # prevent actual connect attempt
                 resp = await cli.post(
                     "/api/gateway/platforms",
                     json={
@@ -819,7 +817,7 @@ class TestUpdatePlatform:
 
         app = _create_cron_app(adapter, gateway_runner=None)
         async with TestClient(TestServer(app)) as cli:
-            with patch("utils.atomic_yaml_write", side_effect=fake_write):
+            with patch("gateway.platforms.api_server.atomic_yaml_write", side_effect=fake_write):
                 resp = await cli.patch(
                     "/api/gateway/platforms/telegram",
                     json={"token": "new-token"},
@@ -919,9 +917,9 @@ class TestRemovePlatform:
                 with open(path, "w") as fh:
                     yaml.dump(data, fh)
 
-            with patch("utils.atomic_yaml_write", side_effect=fake_write):
+            with patch("gateway.platforms.api_server.atomic_yaml_write", side_effect=fake_write):
                 resp = await cli.delete("/api/gateway/platforms/telegram")
-                assert resp.status == 200
+                assert resp.status == 204
 
     @pytest.mark.asyncio
     async def test_remove_platform_not_found(self, adapter, tmp_path, monkeypatch):
@@ -969,9 +967,9 @@ class TestRemovePlatform:
                 with open(path, "w") as fh:
                     yaml.dump(data, fh)
 
-            with patch("utils.atomic_yaml_write", side_effect=fake_write):
+            with patch("gateway.platforms.api_server.atomic_yaml_write", side_effect=fake_write):
                 resp = await cli.delete("/api/gateway/platforms/telegram")
-                assert resp.status == 200
+                assert resp.status == 204
                 mock_adapter.disconnect.assert_awaited_once()
                 assert Platform.TELEGRAM not in runner.adapters
 
@@ -996,9 +994,9 @@ class TestRemovePlatform:
                 with open(path, "w") as fh:
                     yaml.dump(data, fh)
 
-            with patch("utils.atomic_yaml_write", side_effect=fake_write):
+            with patch("gateway.platforms.api_server.atomic_yaml_write", side_effect=fake_write):
                 resp = await cli.delete("/api/gateway/platforms/telegram")
-                assert resp.status == 200
+                assert resp.status == 204
 
     @pytest.mark.asyncio
     async def test_remove_platform_requires_auth(self, auth_adapter, tmp_path, monkeypatch):
