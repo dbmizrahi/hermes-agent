@@ -3538,7 +3538,7 @@ class GatewayRunner:
                     providers = list_authenticated_providers(
                         current_provider=current_provider,
                         user_providers=user_provs,
-                        max_models=8,
+                        max_models=50,
                     )
                 except Exception:
                     providers = []
