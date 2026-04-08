@@ -1,0 +1,76 @@
+{
+    "info": {
+        "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Hermes Agent API",
+        "description": "Complete API collection for testing the Hermes Agent API server. Run on http://localhost:8642 with API key auth.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        "_exporter_id": "hermes-agent-exports"
+    },
+    "variable": [
+        {
+            "key": "base_url",
+            "value": "http://localhost:8642",
+            "type": "string"
+        },
+        {
+            "key": "api_key",
+            "value": "mcc-local-dev",
+            "type": "string"
+        },
+        {
+            "key": "access_token",
+            "value": "",
+            "type": "string"
+        },
+        {
+            "key": "session_id",
+            "value": "",
+            "type": "string"
+        },
+        {
+            "key": "job_id",
+            "value": "",
+            "type": "string"
+        }
+    ],
+    "item": {
+        "name": "System",
+        "description": "System-level endpoints for health checks and basic server info.",
+        "item": {
+            "name": "Health Check",
+            "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                    "raw": "{{base_url}}/health",
+                    "host": [
+                        "{{base_url}}"
+                    ],
+                    "path": [
+                        "health"
+                    ]
+                },
+                "description": "Basic health check endpoint (no authentication required). Returns server status."
+            },
+            "response": [],
+            "event": [
+                {
+                    "listen": "test",
+                    "script": {
+                        "exec": [
+                            "pm.test(\"Status code is 200\", function () {",
+                            "    pm.response.to.have.status(200);",
+                            "});",
+                            "",
+                            "pm.test(\"Response has status field\", function () {",
+                            "    var json = pm.response.json();",
+                            "    pm.expect(json).to.have.property('status');",
+                            "});"
+                        ],
+                        "type": "text/javascript"
+                    }
+                }
+            ]
+        }
+    }
+}
