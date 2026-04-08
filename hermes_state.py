@@ -789,11 +789,12 @@ class SessionDB:
             total = self._conn.execute(
                 f"SELECT COUNT(*) FROM sessions {where}", params
             ).fetchone()[0]
-            rows = self._conn.execute(
+            cursor = self._conn.execute(
                 f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
                 params + [limit, offset]
-            ).fetchall()
-            cols = [d[0] for d in self._conn.description]
+            )
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
             sessions = [dict(zip(cols, row)) for row in rows]
             return sessions, total
 
