@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
 
 from hermes_cli.providers import (
+    custom_provider_slug,
     determine_api_mode,
     get_label,
     is_aggregator,
@@ -336,6 +337,7 @@ def resolve_alias(
 def get_authenticated_provider_slugs(
     current_provider: str = "",
     user_providers: dict = None,
+    custom_providers: list | None = None,
 ) -> list[str]:
     """Return slugs of providers that have credentials.
 
@@ -346,6 +348,7 @@ def get_authenticated_provider_slugs(
         providers = list_authenticated_providers(
             current_provider=current_provider,
             user_providers=user_providers,
+            custom_providers=custom_providers,
             max_models=0,
         )
         return [p["slug"] for p in providers]
@@ -383,6 +386,7 @@ def switch_model(
     is_global: bool = False,
     explicit_provider: str = "",
     user_providers: dict = None,
+    custom_providers: list | None = None,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -416,6 +420,7 @@ def switch_model(
         is_global: Whether to persist the switch.
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
+        custom_providers: The ``custom_providers:`` list from config.yaml.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -436,7 +441,11 @@ def switch_model(
     # =================================================================
     if explicit_provider:
         # Resolve the provider
-        pdef = resolve_provider_full(explicit_provider, user_providers)
+        pdef = resolve_provider_full(
+            explicit_provider,
+            user_providers,
+            custom_providers,
+        )
         if pdef is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
@@ -516,6 +525,7 @@ def switch_model(
                 authed = get_authenticated_provider_slugs(
                     current_provider=current_provider,
                     user_providers=user_providers,
+                    custom_providers=custom_providers,
                 )
                 fallback_result = _resolve_alias_fallback(raw_input, authed)
                 if fallback_result is not None:
@@ -537,8 +547,11 @@ def switch_model(
                     )
             else:
                 # --- Step c: On aggregator, convert vendor:model to vendor/model ---
+                # Only convert when there's no slash — a slash means the name
+                # is already in vendor/model format and the colon is a variant
+                # tag (:free, :extended, :fast) that must be preserved.
                 colon_pos = raw_input.find(":")
-                if colon_pos > 0 and is_aggregator(current_provider):
+                if colon_pos > 0 and "/" not in raw_input and is_aggregator(current_provider):
                     left = raw_input[:colon_pos].strip().lower()
                     right = raw_input[colon_pos + 1:].strip()
                     if left and right:
@@ -587,6 +600,14 @@ def switch_model(
 
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)
+    if target_provider.startswith("custom:"):
+        custom_pdef = resolve_provider_full(
+            target_provider,
+            user_providers,
+            custom_providers,
+        )
+        if custom_pdef is not None:
+            provider_label = custom_pdef.name
 
     # --- Resolve credentials ---
     api_key = current_api_key
@@ -705,6 +726,7 @@ def switch_model(
 def list_authenticated_providers(
     current_provider: str = "",
     user_providers: dict = None,
+    custom_providers: list | None = None,
     max_models: int = 8,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
@@ -730,6 +752,7 @@ def list_authenticated_providers(
         fetch_models_dev,
         get_provider_info as _mdev_pinfo,
     )
+    from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
 
     results: List[dict] = []
@@ -750,9 +773,16 @@ def list_authenticated_providers(
         if not isinstance(pdata, dict):
             continue
 
-        env_vars = pdata.get("env", [])
-        if not isinstance(env_vars, list):
-            continue
+        # Prefer auth.py PROVIDER_REGISTRY for env var names — it's our
+        # source of truth.  models.dev can have wrong mappings (e.g.
+        # minimax-cn → MINIMAX_API_KEY instead of MINIMAX_CN_API_KEY).
+        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        if pconfig and pconfig.api_key_env_vars:
+            env_vars = list(pconfig.api_key_env_vars)
+        else:
+            env_vars = pdata.get("env", [])
+            if not isinstance(env_vars, list):
+                continue
 
         # Check if any env var is set
         has_creds = any(os.environ.get(ev) for ev in env_vars)
@@ -841,6 +871,43 @@ def list_authenticated_providers(
                 "source": "user-config",
                 "api_url": api_url,
             })
+
+    # --- 4. Saved custom providers from config ---
+    if custom_providers and isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+
+            display_name = (entry.get("name") or "").strip()
+            api_url = (
+                entry.get("base_url", "")
+                or entry.get("url", "")
+                or entry.get("api", "")
+                or ""
+            ).strip()
+            if not display_name or not api_url:
+                continue
+
+            slug = custom_provider_slug(display_name)
+            if slug in seen_slugs:
+                continue
+
+            models_list = []
+            default_model = (entry.get("model") or "").strip()
+            if default_model:
+                models_list.append(default_model)
+
+            results.append({
+                "slug": slug,
+                "name": display_name,
+                "is_current": slug == current_provider,
+                "is_user_defined": True,
+                "models": models_list,
+                "total_models": len(models_list),
+                "source": "user-config",
+                "api_url": api_url,
+            })
+            seen_slugs.add(slug)
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))

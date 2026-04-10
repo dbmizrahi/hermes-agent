@@ -39,7 +39,7 @@ def _get_service_pids() -> set:
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    if is_linux():
+    if supports_systemd_services():
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
@@ -224,6 +224,14 @@ def stop_profile_gateway() -> bool:
 
 def is_linux() -> bool:
     return sys.platform.startswith('linux')
+
+
+from hermes_constants import is_termux
+
+
+def supports_systemd_services() -> bool:
+    return is_linux() and not is_termux()
+
 
 def is_macos() -> bool:
     return sys.platform == 'darwin'
@@ -477,13 +485,15 @@ def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, b
 
 
 def get_systemd_linger_status() -> tuple[bool | None, str]:
-    """Return whether systemd user lingering is enabled for the current user.
+    """Return systemd linger status for the current user.
 
     Returns:
         (True, "") when linger is enabled.
         (False, "") when linger is disabled.
         (None, detail) when the status could not be determined.
     """
+    if is_termux():
+        return None, "not supported in Termux"
     if not is_linux():
         return None, "not supported on this platform"
 
@@ -608,6 +618,24 @@ def _build_user_local_paths(home: Path, path_entries: list[str]) -> list[str]:
     return [p for p in candidates if p not in path_entries and Path(p).exists()]
 
 
+def _remap_path_for_user(path: str, target_home_dir: str) -> str:
+    """Remap *path* from the current user's home to *target_home_dir*.
+
+    If *path* lives under ``Path.home()`` the corresponding prefix is swapped
+    to *target_home_dir*; otherwise the path is returned unchanged.
+
+      /root/.hermes/hermes-agent  -> /home/alice/.hermes/hermes-agent
+      /opt/hermes                 -> /opt/hermes  (kept as-is)
+    """
+    current_home = Path.home().resolve()
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(current_home)
+        return str(Path(target_home_dir) / relative)
+    except ValueError:
+        return str(resolved)
+
+
 def _hermes_home_for_target_user(target_home_dir: str) -> str:
     """Remap the current HERMES_HOME to the equivalent under a target user's home.
 
@@ -655,6 +683,15 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         username, group_name, home_dir = _system_service_identity(run_as_user)
         hermes_home = _hermes_home_for_target_user(home_dir)
         profile_arg = _profile_arg(hermes_home)
+        # Remap all paths that may resolve under the calling user's home
+        # (e.g. /root/) to the target user's home so the service can
+        # actually access them.
+        python_path = _remap_path_for_user(python_path, home_dir)
+        working_dir = _remap_path_for_user(working_dir, home_dir)
+        venv_dir = _remap_path_for_user(venv_dir, home_dir)
+        venv_bin = _remap_path_for_user(venv_bin, home_dir)
+        node_bin = _remap_path_for_user(node_bin, home_dir)
+        path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)
@@ -766,7 +803,7 @@ def _print_linger_enable_warning(username: str, detail: str | None = None) -> No
 
 def _ensure_linger_enabled() -> None:
     """Enable linger when possible so the user gateway survives logout."""
-    if not is_linux():
+    if is_termux() or not is_linux():
         return
 
     import getpass
@@ -1588,6 +1625,34 @@ _PLATFORMS = [
              "help": "Chat ID for scheduled results and notifications."},
         ],
     },
+    {
+        "key": "bluebubbles",
+        "label": "BlueBubbles (iMessage)",
+        "emoji": "💬",
+        "token_var": "BLUEBUBBLES_SERVER_URL",
+        "setup_instructions": [
+            "1. Install BlueBubbles on a Mac that will act as your iMessage server:",
+            "   https://bluebubbles.app/",
+            "2. Complete the BlueBubbles setup wizard — sign in with your Apple ID",
+            "3. In BlueBubbles Settings → API, note the Server URL and password",
+            "4. The server URL is typically http://<your-mac-ip>:1234",
+            "5. Hermes connects via the BlueBubbles REST API and receives",
+            "   incoming messages via a local webhook",
+            "6. To authorize users, use DM pairing: hermes pairing generate bluebubbles",
+            "   Share the code — the user sends it via iMessage to get approved",
+        ],
+        "vars": [
+            {"name": "BLUEBUBBLES_SERVER_URL", "prompt": "BlueBubbles server URL (e.g. http://192.168.1.10:1234)", "password": False,
+             "help": "The URL shown in BlueBubbles Settings → API."},
+            {"name": "BLUEBUBBLES_PASSWORD", "prompt": "BlueBubbles server password", "password": True,
+             "help": "The password shown in BlueBubbles Settings → API."},
+            {"name": "BLUEBUBBLES_ALLOWED_USERS", "prompt": "Pre-authorized phone numbers or iMessage IDs (comma-separated, or leave empty for DM pairing)", "password": False,
+             "is_allowlist": True,
+             "help": "Optional — pre-authorize specific users. Leave empty to use DM pairing instead (recommended)."},
+            {"name": "BLUEBUBBLES_HOME_CHANNEL", "prompt": "Home channel (phone number or iMessage ID for cron/notifications, or empty)", "password": False,
+             "help": "Phone number or Apple ID to deliver cron results and notifications to."},
+        ],
+    },
 ]
 
 
@@ -1773,7 +1838,7 @@ def _setup_whatsapp():
 
 def _is_service_installed() -> bool:
     """Check if the gateway is installed as a system service."""
-    if is_linux():
+    if supports_systemd_services():
         return get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()
     elif is_macos():
         return get_launchd_plist_path().exists()
@@ -1782,7 +1847,7 @@ def _is_service_installed() -> bool:
 
 def _is_service_running() -> bool:
     """Check if the gateway service is currently running."""
-    if is_linux():
+    if supports_systemd_services():
         user_unit_exists = get_systemd_unit_path(system=False).exists()
         system_unit_exists = get_systemd_unit_path(system=True).exists()
 
@@ -1955,7 +2020,7 @@ def gateway_setup():
     service_installed = _is_service_installed()
     service_running = _is_service_running()
 
-    if is_linux() and has_conflicting_systemd_units():
+    if supports_systemd_services() and has_conflicting_systemd_units():
         print_systemd_scope_conflict_warning()
         print()
 
@@ -1965,7 +2030,7 @@ def gateway_setup():
         print_warning("Gateway service is installed but not running.")
         if prompt_yes_no("  Start it now?", True):
             try:
-                if is_linux():
+                if supports_systemd_services():
                     systemd_start()
                 elif is_macos():
                     launchd_start()
@@ -2016,7 +2081,7 @@ def gateway_setup():
         if service_running:
             if prompt_yes_no("  Restart the gateway to pick up changes?", True):
                 try:
-                    if is_linux():
+                    if supports_systemd_services():
                         systemd_restart()
                     elif is_macos():
                         launchd_restart()
@@ -2028,7 +2093,7 @@ def gateway_setup():
         elif service_installed:
             if prompt_yes_no("  Start the gateway service?", True):
                 try:
-                    if is_linux():
+                    if supports_systemd_services():
                         systemd_start()
                     elif is_macos():
                         launchd_start()
@@ -2036,13 +2101,13 @@ def gateway_setup():
                     print_error(f"  Start failed: {e}")
         else:
             print()
-            if is_linux() or is_macos():
-                platform_name = "systemd" if is_linux() else "launchd"
+            if supports_systemd_services() or is_macos():
+                platform_name = "systemd" if supports_systemd_services() else "launchd"
                 if prompt_yes_no(f"  Install the gateway as a {platform_name} service? (runs in background, starts on boot)", True):
                     try:
                         installed_scope = None
                         did_install = False
-                        if is_linux():
+                        if supports_systemd_services():
                             installed_scope, did_install = install_linux_gateway_from_setup(force=False)
                         else:
                             launchd_install(force=False)
@@ -2050,7 +2115,7 @@ def gateway_setup():
                         print()
                         if did_install and prompt_yes_no("  Start the service now?", True):
                             try:
-                                if is_linux():
+                                if supports_systemd_services():
                                     systemd_start(system=installed_scope == "system")
                                 else:
                                     launchd_start()
@@ -2061,12 +2126,18 @@ def gateway_setup():
                         print_info("  You can try manually: hermes gateway install")
                 else:
                     print_info("  You can install later: hermes gateway install")
-                    if is_linux():
+                    if supports_systemd_services():
                         print_info("  Or as a boot-time service: sudo hermes gateway install --system")
                     print_info("  Or run in foreground:  hermes gateway")
             else:
-                print_info("  Service install not supported on this platform.")
-                print_info("  Run in foreground: hermes gateway")
+                if is_termux():
+                    from hermes_constants import display_hermes_home as _dhh
+                    print_info("  Termux does not use systemd/launchd services.")
+                    print_info("  Run in foreground: hermes gateway")
+                    print_info(f"  Or start it manually in the background (best effort): nohup hermes gateway >{_dhh()}/logs/gateway.log 2>&1 &")
+                else:
+                    print_info("  Service install not supported on this platform.")
+                    print_info("  Run in foreground: hermes gateway")
     else:
         print()
         print_info("No platforms configured. Run 'hermes gateway setup' when ready.")
@@ -2102,7 +2173,11 @@ def gateway_command(args):
         force = getattr(args, 'force', False)
         system = getattr(args, 'system', False)
         run_as_user = getattr(args, 'run_as_user', None)
-        if is_linux():
+        if is_termux():
+            print("Gateway service installation is not supported on Termux.")
+            print("Run manually: hermes gateway")
+            sys.exit(1)
+        if supports_systemd_services():
             systemd_install(force=force, system=system, run_as_user=run_as_user)
         elif is_macos():
             launchd_install(force)
@@ -2116,7 +2191,11 @@ def gateway_command(args):
             managed_error("uninstall gateway service (managed by NixOS)")
             return
         system = getattr(args, 'system', False)
-        if is_linux():
+        if is_termux():
+            print("Gateway service uninstall is not supported on Termux because there is no managed service to remove.")
+            print("Stop manual runs with: hermes gateway stop")
+            sys.exit(1)
+        if supports_systemd_services():
             systemd_uninstall(system=system)
         elif is_macos():
             launchd_uninstall()
@@ -2126,7 +2205,11 @@ def gateway_command(args):
     
     elif subcmd == "start":
         system = getattr(args, 'system', False)
-        if is_linux():
+        if is_termux():
+            print("Gateway service start is not supported on Termux because there is no system service manager.")
+            print("Run manually: hermes gateway")
+            sys.exit(1)
+        if supports_systemd_services():
             systemd_start(system=system)
         elif is_macos():
             launchd_start()
@@ -2141,7 +2224,7 @@ def gateway_command(args):
         if stop_all:
             # --all: kill every gateway process on the machine
             service_available = False
-            if is_linux() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
                 try:
                     systemd_stop(system=system)
                     service_available = True
@@ -2162,7 +2245,7 @@ def gateway_command(args):
         else:
             # Default: stop only the current profile's gateway
             service_available = False
-            if is_linux() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
                 try:
                     systemd_stop(system=system)
                     service_available = True
@@ -2190,7 +2273,7 @@ def gateway_command(args):
         system = getattr(args, 'system', False)
         service_configured = False
         
-        if is_linux() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+        if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             service_configured = True
             try:
                 systemd_restart(system=system)
@@ -2207,7 +2290,7 @@ def gateway_command(args):
         
         if not service_available:
             # systemd/launchd restart failed — check if linger is the issue
-            if is_linux():
+            if supports_systemd_services():
                 linger_ok, _detail = get_systemd_linger_status()
                 if linger_ok is not True:
                     import getpass
@@ -2244,7 +2327,7 @@ def gateway_command(args):
         system = getattr(args, 'system', False)
         
         # Check for service first
-        if is_linux() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+        if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             systemd_status(deep, system=system)
         elif is_macos() and get_launchd_plist_path().exists():
             launchd_status(deep)
@@ -2261,9 +2344,13 @@ def gateway_command(args):
                     for line in runtime_lines:
                         print(f"  {line}")
                 print()
-                print("To install as a service:")
-                print("  hermes gateway install")
-                print("  sudo hermes gateway install --system")
+                if is_termux():
+                    print("Termux note:")
+                    print("  Android may stop background jobs when Termux is suspended")
+                else:
+                    print("To install as a service:")
+                    print("  hermes gateway install")
+                    print("  sudo hermes gateway install --system")
             else:
                 print("✗ Gateway is not running")
                 runtime_lines = _runtime_health_lines()
@@ -2275,5 +2362,8 @@ def gateway_command(args):
                 print()
                 print("To start:")
                 print("  hermes gateway          # Run in foreground")
-                print("  hermes gateway install  # Install as user service")
-                print("  sudo hermes gateway install --system  # Install as boot-time system service")
+                if is_termux():
+                    print("  nohup hermes gateway > ~/.hermes/logs/gateway.log 2>&1 &  # Best-effort background start")
+                else:
+                    print("  hermes gateway install  # Install as user service")
+                    print("  sudo hermes gateway install --system  # Install as boot-time system service")
