@@ -1,6 +1,8 @@
 import {
   Bot, Brain, BookOpen, MessageSquare, MessagesSquare,
-  Clock, Radio, Satellite, Plug, LayoutDashboard, Server
+  Clock, Radio, Satellite, Plug, LayoutDashboard, Server,
+  Terminal, FileText, Cpu, Cable, Settings2, Network, Monitor,
+  KanbanSquare, Users, ScrollText
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -11,23 +13,46 @@ import {
 
 const coreItems = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard },
+  { title: "Agents", url: "/agents", icon: Bot },
   { title: "Sessions", url: "/sessions", icon: MessageSquare },
   { title: "Chat", url: "/chat", icon: MessagesSquare },
+];
+
+const toolsItems = [
+  { title: "Terminal", url: "/terminal", icon: Terminal },
+  { title: "Files", url: "/files", icon: FileText },
+];
+
+const modelsItems = [
+  { title: "Models", url: "/models", icon: Cpu },
+];
+
+const integrationItems = [
+  { title: "ACP", url: "/acp", icon: Cable },
+  { title: "MCP", url: "/mcp", icon: Plug },
+];
+
+const infraItems = [
+  { title: "Env", url: "/env", icon: Settings2 },
+  { title: "Network", url: "/network", icon: Network },
+  { title: "Gateway", url: "/gateway", icon: Radio },
+  { title: "Channels", url: "/channels", icon: Satellite },
+];
+
+const collaborationItems = [
+  { title: "Virtual Office", url: "/virtual-office", icon: Monitor },
+  { title: "Task Board", url: "/task-board", icon: KanbanSquare },
+  { title: "Teams", url: "/teams", icon: Users },
+];
+
+const automationItems = [
+  { title: "Cron Jobs", url: "/cron", icon: Clock },
+  { title: "Logs", url: "/logs", icon: ScrollText },
 ];
 
 const knowledgeItems = [
   { title: "Memory", url: "/memory", icon: Brain },
   { title: "Skills", url: "/skills", icon: BookOpen },
-];
-
-const automationItems = [
-  { title: "Cron Jobs", url: "/cron", icon: Clock },
-];
-
-const infraItems = [
-  { title: "Gateway", url: "/gateway", icon: Radio },
-  { title: "Channels", url: "/channels", icon: Satellite },
-  { title: "MCP", url: "/mcp", icon: Plug },
 ];
 
 function NavGroup({ label, items }: { label: string; items: typeof coreItems }) {
@@ -77,9 +102,13 @@ export function AppSidebar() {
       </SidebarHeader>
       <SidebarContent>
         <NavGroup label="Core" items={coreItems} />
+        <NavGroup label="Tools" items={toolsItems} />
+        <NavGroup label="Models" items={modelsItems} />
+        <NavGroup label="Integration" items={integrationItems} />
         <NavGroup label="Knowledge" items={knowledgeItems} />
-        <NavGroup label="Automation" items={automationItems} />
         <NavGroup label="Infrastructure" items={infraItems} />
+        <NavGroup label="Collaboration" items={collaborationItems} />
+        <NavGroup label="Automation" items={automationItems} />
       </SidebarContent>
     </Sidebar>
   );

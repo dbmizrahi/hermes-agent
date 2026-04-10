@@ -15,6 +15,17 @@ import CronPage from "./pages/CronPage";
 import GatewayPage from "./pages/GatewayPage";
 import ChannelsPage from "./pages/ChannelsPage";
 import MCPPage from "./pages/MCPPage";
+import AgentsPage from "./pages/AgentsPage";
+import TerminalPage from "./pages/TerminalPage";
+import FilesPage from "./pages/FilesPage";
+import ModelsPage from "./pages/ModelsPage";
+import ACPPage from "./pages/ACPPage";
+import EnvPage from "./pages/EnvPage";
+import NetworkPage from "./pages/NetworkPage";
+import VirtualOfficePage from "./pages/VirtualOfficePage";
+import TaskBoardPage from "./pages/TaskBoardPage";
+import TeamsPage from "./pages/TeamsPage";
+import LogsPage from "./pages/LogsPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient({
@@ -121,6 +132,116 @@ function AppRoutes() {
           <ProtectedRoute>
             <AppLayout>
               <MCPPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/agents"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <AgentsPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/terminal"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <TerminalPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/files"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <FilesPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/models"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <ModelsPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/acp"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <ACPPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/env"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <EnvPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/network"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <NetworkPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/virtual-office"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <VirtualOfficePage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/task-board"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <TaskBoardPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/teams"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <TeamsPage />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/logs"
+        element={
+          <ProtectedRoute>
+            <AppLayout>
+              <LogsPage />
             </AppLayout>
           </ProtectedRoute>
         }
