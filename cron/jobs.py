@@ -319,7 +319,10 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
-    ensure_dirs()
+    try:
+        ensure_dirs()
+    except Exception:
+        pass  # best-effort directory creation
     if not JOBS_FILE.exists():
         return []
     
@@ -346,8 +349,21 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
-    ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    try:
+        ensure_dirs()
+    except Exception:
+        pass  # best-effort directory creation (matches load_jobs pattern)
+
+    # If directory still doesn't exist after best-effort ensure_dirs, skip save
+    if not JOBS_FILE.parent.exists():
+        logger.error("Cannot save jobs: cron directory %s does not exist and could not be created", JOBS_FILE.parent)
+        return
+
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    except OSError as e:
+        logger.error("Failed to create temp file for jobs save: %s", e)
+        return
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)

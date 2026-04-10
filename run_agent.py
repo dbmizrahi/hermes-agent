@@ -4333,7 +4333,6 @@ class AIAgent:
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
-                "stream_options": {"include_usage": True},
                 "timeout": _httpx.Timeout(
                     connect=30.0,
                     read=_stream_read_timeout,
@@ -4341,6 +4340,9 @@ class AIAgent:
                     pool=30.0,
                 ),
             }
+            # DashScope ignores stream_options.include_usage
+            if (getattr(self, "provider", "") or "").lower() != "alibaba":
+                stream_kwargs["stream_options"] = {"include_usage": True}
             request_client_holder["client"] = self._create_request_openai_client(
                 reason="chat_completion_stream_request"
             )
@@ -7790,6 +7792,41 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                    else:
+                        # Provider did not return usage (common with DashScope/Alibaba streaming).
+                        # Estimate tokens so metrics and context tracking still work.
+                        try:
+                            from agent.model_metadata import estimate_tokens_rough
+                            # Estimate prompt from API messages
+                            prompt_tokens = sum(
+                                estimate_tokens_rough(str(m.get("content", "")))
+                                for m in api_messages if isinstance(m, dict)
+                            )
+                            # Estimate completion from response content
+                            content_text = ""
+                            if hasattr(response, "choices") and response.choices:
+                                content_text = getattr(response.choices[0].message, "content", "") or ""
+                            elif hasattr(response, "content"):
+                                content_text = str(response.content) if response.content else ""
+                            
+                            completion_tokens = estimate_tokens_rough(content_text)
+                            total_tokens = prompt_tokens + completion_tokens
+
+                            usage_dict = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens,
+                            }
+                            self.context_compressor.update_from_response(usage_dict)
+
+                            self.session_prompt_tokens += prompt_tokens
+                            self.session_completion_tokens += completion_tokens
+                            self.session_total_tokens += total_tokens
+                            self.session_api_calls += 1
+                            self.session_input_tokens += prompt_tokens
+                            self.session_output_tokens += completion_tokens
+                        except Exception as est_err:
+                            logger.warning(f"Failed to estimate tokens: {est_err}")
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")

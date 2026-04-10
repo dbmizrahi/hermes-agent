@@ -35,6 +35,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.metrics import global_metrics, MetricsTracker
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -68,7 +69,9 @@ class ResponseStore:
 
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+        import threading
         self._max_size = max_size
+        self._lock = threading.Lock()
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -76,128 +79,182 @@ class ResponseStore:
             except Exception:
                 db_path = ":memory:"
         try:
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._db_path = db_path
         except Exception:
-            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
-            )"""
-        )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
-            )"""
-        )
-        self._conn.commit()
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS auth_tokens (
-                jti TEXT PRIMARY KEY,
-                token_type TEXT NOT NULL,
-                issued_at REAL NOT NULL,
-                expires_at REAL NOT NULL
-            )"""
-        )
-        self._conn.commit()
+            self._db_path = ":memory:"
+        # Initialise schema on the persistent path so all connections share it
+        self._init_schema()
+
+    # ------------------------------------------------------------------
+    # Per-operation connection helper (thread-safe)
+    # ------------------------------------------------------------------
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Open a fresh connection with WAL mode for each operation."""
+        conn = sqlite3.connect(self._db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_schema(self) -> None:
+        """Create tables if they do not exist (runs once at startup)."""
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS responses (
+                    response_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    accessed_at REAL NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS conversations (
+                    name TEXT PRIMARY KEY,
+                    response_id TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS auth_tokens (
+                    jti TEXT PRIMARY KEY,
+                    token_type TEXT NOT NULL,
+                    issued_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                )"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def store_refresh_token(self, jti: str, expires_at: float) -> None:
         import time
-        self._conn.execute(
-            "INSERT OR REPLACE INTO auth_tokens (jti, token_type, issued_at, expires_at) VALUES (?, 'refresh', ?, ?)",
-            (jti, time.time(), expires_at),
-        )
-        self._conn.commit()
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO auth_tokens (jti, token_type, issued_at, expires_at) VALUES (?, 'refresh', ?, ?)",
+                (jti, time.time(), expires_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def is_refresh_token_valid(self, jti: str) -> bool:
         import time
-        row = self._conn.execute(
-            "SELECT token_type, expires_at FROM auth_tokens WHERE jti = ?", (jti,)
-        ).fetchone()
-        if row is None:
-            return False
-        token_type, expires_at = row
-        return token_type == "refresh" and expires_at > time.time()
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT token_type, expires_at FROM auth_tokens WHERE jti = ?", (jti,)
+            ).fetchone()
+            if row is None:
+                return False
+            token_type, expires_at = row
+            return token_type == "refresh" and expires_at > time.time()
+        finally:
+            conn.close()
 
     def revoke_token(self, jti: str) -> None:
-        self._conn.execute(
-            "UPDATE auth_tokens SET token_type='revoked' WHERE jti = ?", (jti,)
-        )
-        self._conn.commit()
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "UPDATE auth_tokens SET token_type='revoked' WHERE jti = ?", (jti,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def prune_expired_tokens(self) -> None:
         import time
-        self._conn.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (time.time(),))
-        self._conn.commit()
+        conn = self._get_conn()
+        try:
+            conn.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (time.time(),))
+            conn.commit()
+        finally:
+            conn.close()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
-        ).fetchone()
-        if row is None:
-            return None
         import time
-        self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
-        )
-        self._conn.commit()
-        return json.loads(row[0])
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
+                (time.time(), response_id),
+            )
+            conn.commit()
+            return json.loads(row[0])
+        finally:
+            conn.close()
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
         import time
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            self._conn.execute(
-                "DELETE FROM responses WHERE response_id IN "
-                "(SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?)",
-                (count - self._max_size,),
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+                (response_id, json.dumps(data, default=str), time.time()),
             )
-        self._conn.commit()
+            # Evict oldest entries beyond max_size
+            count = conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+            if count > self._max_size:
+                conn.execute(
+                    "DELETE FROM responses WHERE response_id IN "
+                    "(SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?)",
+                    (count - self._max_size,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
-        ).fetchone()
-        return row[0] if row else None
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
-        )
-        self._conn.commit()
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+                (name, response_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def close(self) -> None:
-        """Close the database connection."""
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        """No-op — connections are per-operation now."""
+        pass
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
-        return row[0] if row else 0
+        conn = self._get_conn()
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -205,31 +262,44 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, PATCH, PUT",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id",
+    "Access-Control-Expose-Headers": "X-Hermes-Session-Id",
 }
 
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
-        """Add CORS headers for explicitly allowed origins; handle OPTIONS preflight."""
+        """Add CORS headers to ALL responses, including errors (404, 500, etc.).
+
+        When no adapter or no CORS origins are configured, defaults to allowing
+        all origins (*).  When origins are configured, respects the allowlist.
+        """
         adapter = request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
-        cors_headers = None
+
         if adapter is not None:
-            if not adapter._origin_allowed(origin):
-                return web.Response(status=403)
             cors_headers = adapter._cors_headers_for_origin(origin)
+            if cors_headers is None and origin:
+                # Origin present but not in allowlist — deny
+                return web.Response(status=403, headers=_CORS_HEADERS)
+            if cors_headers is None:
+                # No origin (non-browser) or no CORS config — allow all
+                cors_headers = dict(_CORS_HEADERS)
+                cors_headers["Access-Control-Allow-Origin"] = "*"
+                cors_headers["Access-Control-Max-Age"] = "600"
+        else:
+            # No adapter — allow all origins by default
+            cors_headers = dict(_CORS_HEADERS)
+            cors_headers["Access-Control-Allow-Origin"] = "*"
+            cors_headers["Access-Control-Max-Age"] = "600"
 
         if request.method == "OPTIONS":
-            if cors_headers is None:
-                return web.Response(status=403)
             return web.Response(status=200, headers=cors_headers)
 
         response = await handler(request)
-        if cors_headers is not None:
-            response.headers.update(cors_headers)
+        response.headers.update(cors_headers)
         return response
 else:
     cors_middleware = None  # type: ignore[assignment]
@@ -281,6 +351,39 @@ else:
     security_headers_middleware = None  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# Metrics tracking middleware
+# ---------------------------------------------------------------------------
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def metrics_middleware(request, handler):
+        """Track request latency, status codes, and record metrics."""
+        start = time.time()
+        try:
+            response = await handler(request)
+            latency_ms = (time.time() - start) * 1000
+            status = response.status if hasattr(response, 'status') else 200
+            adapter = request.app.get("api_server_adapter")
+            if adapter and adapter._metrics:
+                adapter._metrics.record_request(latency_ms, status)
+            return response
+        except web.HTTPException as exc:
+            latency_ms = (time.time() - start) * 1000
+            adapter = request.app.get("api_server_adapter")
+            if adapter and adapter._metrics:
+                adapter._metrics.record_error(exc.status)
+            raise
+        except Exception:
+            latency_ms = (time.time() - start) * 1000
+            adapter = request.app.get("api_server_adapter")
+            if adapter and adapter._metrics:
+                adapter._metrics.record_error(500)
+            raise
+else:
+    metrics_middleware = None  # type: ignore[assignment]
+
+
 class _IdempotencyCache:
     """In-memory idempotency cache with TTL and basic LRU semantics."""
 
@@ -312,6 +415,79 @@ class _IdempotencyCache:
 
 
 _idem_cache = _IdempotencyCache()
+
+
+# ---------------------------------------------------------------------------
+# Metrics Tracker
+# ---------------------------------------------------------------------------
+
+class MetricsTracker:
+    """Thread-safe sliding-window metrics for the API gateway."""
+
+    def __init__(self, window_seconds: float = 60.0, max_latencies: int = 1000):
+        import threading
+        self._lock = threading.Lock()
+        self._window = window_seconds
+        self._max_latencies = max_latencies
+
+        # Timestamps of recent requests
+        self._request_log: list = []
+        # Latency samples in milliseconds
+        self._latencies: list = []
+        # Total requests and errors (all-time, for error rate baseline)
+        self._total_requests: int = 0
+        self._total_errors: int = 0
+
+    def record_request(self, latency_ms: float, status_code: int) -> None:
+        """Record a completed request with its latency and status code."""
+        now = time.time()
+        with self._lock:
+            self._request_log.append(now)
+            self._latencies.append(latency_ms)
+            # Trim latencies to prevent unbounded growth
+            if len(self._latencies) > self._max_latencies:
+                self._latencies = self._latencies[-self._max_latencies:]
+            self._total_requests += 1
+            if status_code >= 400:
+                self._total_errors += 1
+
+    def record_error(self, status_code: int) -> None:
+        """Record an error for requests that fail before full processing (e.g. auth errors)."""
+        with self._lock:
+            self._total_requests += 1
+            if status_code >= 400:
+                self._total_errors += 1
+
+    def get_metrics(self) -> Dict[str, float]:
+        """Calculate current metrics from the sliding window."""
+        now = time.time()
+        cutoff = now - self._window
+
+        with self._lock:
+            # Requests per second: count requests in last 1 second
+            one_second_ago = now - 1.0
+            requests_per_second = sum(1 for ts in self._request_log if ts >= one_second_ago)
+
+            # Average latency (all samples)
+            if self._latencies:
+                avg_latency_ms = sum(self._latencies) / len(self._latencies)
+            else:
+                avg_latency_ms = 0.0
+
+            # Error rate: percentage of 4xx/5xx responses
+            if self._total_requests > 0:
+                error_rate = (self._total_errors / self._total_requests) * 100.0
+            else:
+                error_rate = 0.0
+
+            # Trim old entries from request log (older than window)
+            self._request_log = [ts for ts in self._request_log if ts >= cutoff]
+
+        return {
+            "requests_per_second": requests_per_second,
+            "avg_latency_ms": round(avg_latency_ms, 2),
+            "error_rate": round(error_rate, 2),
+        }
 
 
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
@@ -356,6 +532,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._derive_jwt_secret(self._api_key) if self._api_key else None
         )
         self._start_time: float = time.time()
+        self._metrics = global_metrics
 
     @staticmethod
     def _derive_jwt_secret(api_key: str) -> bytes:
@@ -1101,6 +1278,21 @@ class APIServerAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
+    async def _handle_metrics(self, request: "web.Request") -> "web.Response":
+        """GET /api/gateway/metrics — real-time gateway metrics."""
+        metrics = self._metrics.get_metrics()
+        return web.json_response(metrics)
+
+    async def _handle_version(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/version — return hermes-agent version info."""
+        version = "0.8.0"
+        try:
+            from importlib.metadata import version as _pkg_version
+            version = _pkg_version("hermes-agent")
+        except Exception:
+            pass
+        return web.json_response({"version": version, "platform": "hermes-agent"})
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -1492,7 +1684,9 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        resp = web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        resp._metrics_tokens = usage.get("total_tokens", 0)
+        return resp
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -1767,7 +1961,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
-        return web.json_response(response_data)
+        resp = web.json_response(response_data)
+        resp._metrics_tokens = usage.get("total_tokens", 0)
+        return resp
 
     # ------------------------------------------------------------------
     # GET / DELETE response endpoints
@@ -1857,10 +2053,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return cron_err
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in ("true", "1")
-            jobs = self._cron_list(include_disabled=include_disabled)
+            from cron.jobs import list_jobs as _do_list_jobs
+            jobs = _do_list_jobs(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
         except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+            logger.error(f"Failed to list cron jobs: {e}")
+            return web.json_response({"jobs": [], "error": str(e)})
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs — create a new cron job."""
@@ -1894,18 +2092,22 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
 
-            kwargs = {
-                "prompt": prompt,
-                "schedule": schedule,
-                "name": name,
-                "deliver": deliver,
-            }
-            if skills:
-                kwargs["skills"] = skills
-            if repeat is not None:
-                kwargs["repeat"] = repeat
-
-            job = self._cron_create(**kwargs)
+            # Call create_job directly (not via self._cron_create) to avoid
+            # Python binding `self` as the first positional argument, which
+            # collides with the `prompt` keyword argument.
+            from cron.jobs import create_job as _do_create_job
+            job = _do_create_job(
+                prompt=prompt,
+                schedule=schedule,
+                name=name or None,
+                deliver=deliver,
+                skills=skills,
+                repeat=repeat,
+                model=body.get("model"),
+                provider=body.get("provider"),
+                base_url=body.get("base_url"),
+                script=body.get("script"),
+            )
             return web.json_response({"job": job})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
@@ -1922,7 +2124,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = self._cron_get(job_id)
+            from cron.jobs import get_job as _do_get_job
+            job = _do_get_job(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
@@ -1955,7 +2158,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
                 )
-            job = self._cron_update(job_id, sanitized)
+            from cron.jobs import update_job as _do_update_job
+            job = _do_update_job(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
@@ -1974,7 +2178,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            success = self._cron_remove(job_id)
+            from cron.jobs import remove_job as _do_remove_job
+            success = _do_remove_job(job_id)
             if not success:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"ok": True})
@@ -1993,7 +2198,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = self._cron_pause(job_id)
+            from cron.jobs import pause_job as _do_pause_job
+            job = _do_pause_job(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
@@ -2012,7 +2218,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = self._cron_resume(job_id)
+            from cron.jobs import resume_job as _do_resume_job
+            job = _do_resume_job(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
@@ -2031,7 +2238,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = self._cron_trigger(job_id)
+            from cron.jobs import trigger_job as _do_trigger_job
+            job = _do_trigger_job(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
@@ -2092,14 +2300,45 @@ class APIServerAdapter(BasePlatformAdapter):
 
 
     async def _handle_ws_agent(self, request):
-        """GET /ws/agent -- WebSocket endpoint for real-time agent communication."""
-        token = request.query.get("token", "")
-        if self._api_key and token != self._api_key:
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            await ws.send_json({"type": "error", "message": "Invalid API key"})
-            await ws.close()
-            return ws
+        """GET /ws/agent -- WebSocket endpoint for real-time agent communication.
+
+        Accepts authentication via:
+        - ``token`` query parameter: raw API key or JWT access token
+        - ``Authorization`` query parameter: ``Bearer <jwt>`` format
+        """
+        raw_token = request.query.get("token", "")
+        auth_param = request.query.get("authorization", "")
+
+        # Normalise: prefer Authorization query, fall back to token
+        token = ""
+        if auth_param.startswith("Bearer "):
+            token = auth_param[7:].strip()
+        elif raw_token:
+            token = raw_token
+
+        if self._api_key:
+            authorised = False
+
+            # 1. Direct API-key match (backward compatible)
+            if token == self._api_key:
+                authorised = True
+
+            # 2. JWT access-token validation
+            if not authorised and self._jwt_secret and token:
+                try:
+                    import jwt as pyjwt
+                    payload = pyjwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+                    if payload.get("type") in ("access",):
+                        authorised = True
+                except Exception:
+                    pass
+
+            if not authorised:
+                ws = web.WebSocketResponse()
+                await ws.prepare(request)
+                await ws.send_json({"type": "error", "message": "Invalid or expired token"})
+                await ws.close()
+                return ws
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -2412,6 +2651,50 @@ class APIServerAdapter(BasePlatformAdapter):
         session = db.get_session(session_id)
         return web.json_response({"session": session})
 
+    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions — create a new chat session.
+
+        Body (all optional):
+            session_id: str   — explicit UUID; generated if omitted
+            title: str        — human-readable title
+            model: str        — model name
+            source: str       — defaults to ``api_server``
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        session_id = body.get("session_id") or str(uuid.uuid4())
+        title = body.get("title", "").strip()
+        model = body.get("model", "")
+        source = body.get("source", "api_server")
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Database unavailable"), status=503)
+
+        try:
+            db.create_session(
+                session_id=session_id,
+                source=source,
+                model=model or None,
+            )
+            if title:
+                db.set_session_title(session_id, title)
+        except Exception as e:
+            logger.warning("Failed to create session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Failed to create session: {e}", code="session_create_error"),
+                status=500,
+            )
+
+        session = db.get_session(session_id)
+        return web.json_response({"session": session, "session_id": session_id}, status=201)
+
 
     # Cron History & Output API
     # ------------------------------------------------------------------
@@ -2436,7 +2719,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": str(e)}, status=500)
 
         if not output_dir.exists():
-            job = self._cron_get(job_id) if self._CRON_AVAILABLE else None
+            from cron.jobs import get_job as _do_get_job
+            job = _do_get_job(job_id) if self._CRON_AVAILABLE else None
             if job is None:
                 return web.json_response(_openai_error("Job not found", err_type="not_found_error"), status=404)
             return web.json_response({
@@ -2452,7 +2736,8 @@ class APIServerAdapter(BasePlatformAdapter):
         total = len(run_files)
         page = run_files[offset:offset + limit]
 
-        job = self._cron_get(job_id) or {} if self._CRON_AVAILABLE else {}
+        from cron.jobs import get_job as _do_get_job
+        job = _do_get_job(job_id) or {} if self._CRON_AVAILABLE else {}
         runs = [
             {
                 "run_id": f.stem,
@@ -2520,7 +2805,8 @@ class APIServerAdapter(BasePlatformAdapter):
             jobs_map = {}
             if self._CRON_AVAILABLE:
                 try:
-                    jobs_list = self._cron_list()
+                    from cron.jobs import list_jobs as _do_list_jobs
+                    jobs_list = _do_list_jobs()
                     jobs_map = {j["id"]: j.get("name", "") for j in jobs_list}
                 except Exception:
                     pass
@@ -2588,6 +2874,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({
             "status": "running",
+            "platform": "hermes-agent",
             "uptime_seconds": uptime,
             "version": version,
             "model": os.getenv("HERMES_MODEL", ""),
@@ -3220,11 +3507,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, metrics_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/api/version", self._handle_version)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
@@ -3234,6 +3522,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             # Session management API
+            self._app.router.add_post("/api/sessions", self._handle_create_session)
             self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
@@ -3282,6 +3571,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Gateway & platform management
             self._app.router.add_get("/api/gateway/status", self._handle_gateway_status)
+            self._app.router.add_get("/api/gateway/metrics", self._handle_metrics)
             self._app.router.add_get("/api/gateway/platforms", self._handle_list_platforms)
             self._app.router.add_post("/api/gateway/platforms", self._handle_add_platform)
             self._app.router.add_post("/api/gateway/platforms/{name}/connect", self._handle_connect_platform)
