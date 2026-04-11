@@ -18,7 +18,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { getToken, buildUrl } from "@/api/client";
+import { getToken, buildUrl, clearTokens } from "@/api/client";
+import { useNavigate } from "react-router-dom";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -241,12 +242,20 @@ function EmptyState({ onNewChat }: { onNewChat: () => void }) {
 // ---------------------------------------------------------------------------
 
 export default function ChatPage() {
+  const navigate = useNavigate();
   // Sessions stored in local state + persisted to localStorage
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
   const [activeSessionId, setActiveSessionId] = useState<string>("");
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+
+  // Redirect to login if no token
+  useEffect(() => {
+    if (!getToken()) {
+      navigate("/login", { replace: true });
+    }
+  }, [navigate]);
 
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -390,6 +399,12 @@ export default function ChatPage() {
         }),
         signal: abortController.signal,
       });
+
+      if (response.status === 401) {
+        clearTokens();
+        navigate("/login", { replace: true });
+        return;
+      }
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => "");

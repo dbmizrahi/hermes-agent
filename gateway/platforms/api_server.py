@@ -1721,6 +1721,8 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
 
+            _content_was_streamed = False
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
             while True:
@@ -1734,6 +1736,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
+                                _content_was_streamed = True
                                 content_chunk = {
                                     "id": completion_id, "object": "chat.completion.chunk",
                                     "created": created, "model": model,
@@ -1748,6 +1751,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is None:  # End of stream sentinel
                     break
 
+                _content_was_streamed = True
                 content_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
@@ -1756,12 +1760,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
             # Get usage from completed agent
+            result = None
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception:
                 pass
+
+            # Fallback: If no content was streamed, send the final_response
+            # (This handles providers that don't stream content deltas)
+            if not _content_was_streamed and result:
+                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                if final_response:
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": final_response}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
             # Finish chunk
             finish_chunk = {
